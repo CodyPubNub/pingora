@@ -244,6 +244,9 @@ pub trait ProxyHttp {
     /// - Content-Length header is checked first (fail fast before reading)
     /// - Body size is checked during accumulation (streaming protection)
     /// - If exceeded, returns HTTP 413 (Payload Too Large)
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
     fn early_request_body_buffer_limit(
         &self,
         _session: &Session,
@@ -262,6 +265,9 @@ pub trait ProxyHttp {
     /// header-phase filters, so it should not depend on state set by [`Self::request_filter()`].
     ///
     /// The normal [`Self::request_body_filter()`] still runs during upstream body forwarding.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
     async fn early_request_body_filter(
         &self,
         _session: &mut Session,

@@ -379,8 +379,14 @@ where
                 .await?;
         }
 
-        // determine initial downstream state and body buffer
+        #[cfg(not(feature = "early_body_buffer"))]
+        let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+
+        #[cfg(not(feature = "early_body_buffer"))]
+        let buffer = session.as_ref().get_retry_buffer();
+
         // pre-buffered body (from buffer_request_body_early) takes precedence over retry buffer
+        #[cfg(feature = "early_body_buffer")]
         let (mut downstream_state, buffer) = if let Some(body) = session
             .take_buffered_body()
             .filter(|_| session.is_body_buffered())

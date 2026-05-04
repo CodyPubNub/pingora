@@ -497,9 +497,11 @@ pub struct Session {
     /// Request body buffered early (before upstream connection) for auth/routing decisions.
     /// When set, body forwarding will use this instead of re-reading from downstream.
     /// Use accessor methods: `get_buffered_body()`, `take_buffered_body()`, `set_buffered_body()`.
+    #[cfg(feature = "early_body_buffer")]
     buffered_request_body: Option<Bytes>,
     /// Whether body has been fully consumed for buffering.
     /// Use accessor: `is_body_buffered()`.
+    #[cfg(feature = "early_body_buffer")]
     body_buffered: bool,
 }
 
@@ -525,7 +527,9 @@ impl Session {
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
+            #[cfg(feature = "early_body_buffer")]
             buffered_request_body: None,
+            #[cfg(feature = "early_body_buffer")]
             body_buffered: false,
         }
     }
@@ -814,6 +818,7 @@ impl Session {
     ///
     /// The body is buffered by `buffer_request_body_early()` when the trait method
     /// `early_request_body_buffer_limit()` returns `Some(max_size)`.
+    #[cfg(feature = "early_body_buffer")]
     pub fn get_buffered_body(&self) -> Option<&Bytes> {
         self.buffered_request_body.as_ref()
     }
@@ -821,6 +826,7 @@ impl Session {
     /// Takes ownership of the buffered request body, leaving `None` in its place.
     ///
     /// Use this when forwarding the body to upstream - takes the body once for sending.
+    #[cfg(feature = "early_body_buffer")]
     pub fn take_buffered_body(&mut self) -> Option<Bytes> {
         self.buffered_request_body.take()
     }
@@ -829,6 +835,7 @@ impl Session {
     ///
     /// This is called by `buffer_request_body_early()` after reading the full body.
     /// Also useful for app code that wants to replace the body (e.g., decompression).
+    #[cfg(feature = "early_body_buffer")]
     pub fn set_buffered_body(&mut self, body: Option<Bytes>) {
         self.body_buffered = body.is_some() || self.body_buffered;
         self.buffered_request_body = body;
@@ -838,6 +845,7 @@ impl Session {
     ///
     /// When `true`, the body has been fully read and is available via `get_buffered_body()`,
     /// or the request has no body. Body forwarding will skip re-reading from downstream.
+    #[cfg(feature = "early_body_buffer")]
     pub fn is_body_buffered(&self) -> bool {
         self.body_buffered
     }
@@ -846,12 +854,13 @@ impl Session {
     ///
     /// Used when the request has no body (no Content-Length or Transfer-Encoding),
     /// to prevent `buffer_request_body_early()` from attempting to read.
+    #[cfg(feature = "early_body_buffer")]
     pub fn mark_body_buffered(&mut self) {
         self.body_buffered = true;
     }
 
     /// Creates a Session from an H1 HttpSession (for testing only).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "early_body_buffer"))]
     pub fn new_h1_with_http_session(
         http_session: pingora_core::protocols::http::v1::server::HttpSession,
     ) -> Self {
@@ -869,6 +878,8 @@ impl Session {
             subrequest_ctx: None,
             subrequest_spawner: None,
             downstream_modules_ctx: HttpModuleCtx::empty(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules_ctx: HttpModuleCtx::empty(),
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
@@ -961,6 +972,7 @@ where
 
         // early body buffering: read full request body before request_filter
         // see https://github.com/cloudflare/pingora/issues/780
+        #[cfg(feature = "early_body_buffer")]
         if !session.is_body_buffered() {
             if let Err(e) = self.buffer_request_body_early(&mut session, &mut ctx).await {
                 return self
@@ -1215,6 +1227,7 @@ where
     /// - Content-Length checked first (fail fast before reading)
     /// - Accumulated size checked during reading (streaming protection)
     /// - Returns HTTP 413 (Payload Too Large) if exceeded
+    #[cfg(feature = "early_body_buffer")]
     async fn buffer_request_body_early(
         &self,
         session: &mut Session,
@@ -1746,7 +1759,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "early_body_buffer"))]
 mod tests {
     use super::*;
 
