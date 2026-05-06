@@ -22,13 +22,35 @@ use super::v2::server::HttpSession as SessionV2;
 use super::HttpTask;
 use crate::custom_session;
 use crate::protocols::{Digest, SocketAddr, Stream};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
 use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::time::Duration;
+
+/// A reusable HTTP/1.x connection and bytes already read for the next request.
+#[derive(Debug)]
+pub struct ReusedHttpConnection {
+    stream: Stream,
+    pipelined_prefix: Option<BytesMut>,
+}
+
+impl ReusedHttpConnection {
+    pub(crate) fn new(stream: Stream, pipelined_prefix: Option<BytesMut>) -> Self {
+        Self {
+            stream,
+            pipelined_prefix,
+        }
+    }
+
+    /// Split the reusable connection into its underlying stream and optional
+    /// bytes already read for the next pipelined request.
+    pub fn into_parts(self) -> (Stream, Option<BytesMut>) {
+        (self.stream, self.pipelined_prefix)
+    }
+}
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
 pub enum Session {
@@ -227,16 +249,35 @@ impl Session {
         }
     }
 
-    /// Finish the life of this request.
-    /// For H1, if connection reuse is supported, a Some(Stream) will be returned, otherwise None.
+    /// Finish the life of this request and return a reusable stream, if any.
+    ///
+    /// This is the compatibility path: it preserves the pre-pipelining
+    /// stream-only signature and discards any captured pipelined prefix bytes.
+    /// Callers that enable HTTP/1.1 pipelining with
+    /// [`Self::set_pipelining_enabled`] should use [`Self::finish_reuse`]
+    /// instead so the prefix is carried to the next request on the connection.
+    pub async fn finish(self) -> Result<Option<Stream>> {
+        self.finish_reuse().await.map(|opt| {
+            opt.map(|reused| {
+                let (stream, _pipelined_prefix) = reused.into_parts();
+                stream
+            })
+        })
+    }
+
+    /// Finish the life of this request and return pipelining-aware reuse
+    /// metadata, if the connection can be reused.
+    ///
+    /// For H1, if connection reuse is supported, a reusable connection will be returned,
+    /// otherwise None.
     /// For H2, always return None because H2 stream is not reusable.
     /// For subrequests, there is no true underlying stream to return.
-    pub async fn finish(self) -> Result<Option<Stream>> {
+    pub async fn finish_reuse(self) -> Result<Option<ReusedHttpConnection>> {
         match self {
             Self::H1(mut s) => {
                 // need to flush body due to buffering
                 s.finish_body().await?;
-                s.reuse().await
+                s.reuse_pipelined().await
             }
             Self::H2(mut s) => {
                 s.finish()?;
@@ -827,6 +868,40 @@ impl Session {
     pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
         if let Self::H1(s) = self {
             s.set_proxy_tasks_enabled(enabled);
+        }
+    }
+
+    /// Whether HTTP/1.1 request pipelining is enabled for this session.
+    ///
+    /// Always false for H2 / Subrequest / Custom (pipelining is an H/1.1-only
+    /// concept). For H1, see
+    /// [`HttpSession::set_pipelining_enabled`](crate::protocols::http::v1::server::HttpSession::set_pipelining_enabled).
+    pub fn pipelining_enabled(&self) -> bool {
+        match self {
+            Self::H1(s) => s.pipelining_enabled(),
+            _ => false,
+        }
+    }
+
+    /// Enable or disable HTTP/1.1 request pipelining on this session.
+    ///
+    /// No-op for H2 / Subrequest / Custom. See
+    /// [`HttpSession::set_pipelining_enabled`](crate::protocols::http::v1::server::HttpSession::set_pipelining_enabled)
+    /// for semantics.
+    pub fn set_pipelining_enabled(&mut self, enabled: bool) {
+        if let Self::H1(s) = self {
+            s.set_pipelining_enabled(enabled);
+        }
+    }
+
+    /// Set pipelined bytes to be parsed as the start of this session's request.
+    ///
+    /// No-op for non-H1 sessions. See
+    /// [`HttpSession::set_pipelined_prefix`](crate::protocols::http::v1::server::HttpSession::set_pipelined_prefix)
+    /// for the lifecycle.
+    pub fn set_pipelined_prefix(&mut self, prefix: BytesMut) {
+        if let Self::H1(s) = self {
+            s.set_pipelined_prefix(prefix);
         }
     }
 

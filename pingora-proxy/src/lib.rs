@@ -442,11 +442,11 @@ where
             }
             session
                 .downstream_session
-                .finish()
+                .finish_reuse()
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reused_connection(s, persistent_settings))
         } else {
             None
         }
@@ -917,11 +917,11 @@ where
                     }
                     return session
                         .downstream_session
-                        .finish()
+                        .finish_reuse()
                         .await
                         .ok()
                         .flatten()
-                        .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
+                        .map(|s| ReusedHttpStream::from_reused_connection(s, persistent_settings));
                 }
                 /* else continue */
             }
@@ -1106,11 +1106,11 @@ where
             }
             session
                 .downstream_session
-                .finish()
+                .finish_reuse()
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reused_connection(s, persistent_settings))
         } else {
             None
         }
