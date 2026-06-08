@@ -139,7 +139,7 @@ impl ProxyHttp for MyProxy {
     }
 }
 
-// RUST_LOG=INFO cargo run --features openssl --example body_routing
+// RUST_LOG=INFO cargo run --features openssl,early_body_buffer --example body_routing
 //
 // Peek + mutate — body is inspected for routing then wrapped in an envelope:
 //   curl -X POST 127.0.0.1:6193/post -H "Host: httpbin.org" -H "Content-Type: application/json" -d '{"route": "beta"}'
