@@ -255,7 +255,10 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!("Fail to proxy: {e}");
+                error!(
+                    "Fail to proxy: {e}, downstream session type: {}",
+                    downstream_session.session_type()
+                );
                 if matches!(e.etype, InvalidHTTPHeader) {
                     downstream_session
                         .respond_error(400)
@@ -479,6 +482,8 @@ pub struct Session {
     pub ignore_downstream_range: bool,
     /// Were the upstream request headers modified?
     pub upstream_headers_mutated_for_cache: bool,
+    /// Whether downstream and upstream differ on whether this HTTP/1 request is an upgrade.
+    upstream_h1_upgrade_status_mismatch: bool,
     /// The context from parent request, if this is a subrequest.
     pub subrequest_ctx: Option<Box<SubrequestCtx>>,
     /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
@@ -521,6 +526,7 @@ impl Session {
             upstream_compression: ResponseCompressionCtx::new(0, false, false),
             ignore_downstream_range: false,
             upstream_headers_mutated_for_cache: false,
+            upstream_h1_upgrade_status_mismatch: false,
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
