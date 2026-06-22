@@ -29,7 +29,7 @@ use http::request::Parts as ReqParts;
 use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
-use pingora_error::{ErrorType::*, OrErr, Result};
+use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
 pub use http::method::Method;
@@ -73,7 +73,8 @@ pub enum HeaderNameVariant<'a> {
 pub struct RequestHeader {
     base: ReqParts,
     header_name_map: Option<CaseMap>,
-    // store the raw path bytes only if it is invalid utf-8
+    // raw request-target bytes for wire serialization, set when the parsed Uri has
+    // no usable path-and-query: non-UTF-8 paths and the authority-form CONNECT target
     raw_path_fallback: Vec<u8>, // can also be Box<[u8]>
     // whether we send END_STREAM with HEADERS for h2 requests
     send_end_stream: bool,
@@ -257,13 +258,79 @@ impl RequestHeader {
     ///
     /// This API is to allow supporting non UTF-8 cases.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
+        // Drop any fallback left by a prior path; only the CONNECT and non-UTF-8
+        // branches below re-set it. Without this, reusing a header (e.g. mutating a
+        // CONNECT request into a normal one) would serialize the stale target.
+        self.raw_path_fallback.clear();
         if let Ok(p) = std::str::from_utf8(path) {
+            // RFC 9112 §3.2.3: the authority-form request-target ("host[:port]") is
+            // used only for CONNECT. It is opaque to routing and must reach the
+            // tunnel destination verbatim, so keep the parsed Uri (for authority()
+            // access) and re-serialize the original bytes via raw_path(). Reject
+            // anything that is not authority-form: a scheme, path, or query means
+            // it is not a valid CONNECT target.
+            if self.base.method == Method::CONNECT {
+                let uri = p
+                    .parse::<Uri>()
+                    .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {p}"))?;
+                // §3.2.3 authority-form is exactly uri-host ":" port: no scheme,
+                // path, or query, and an authority that has a port and no userinfo.
+                // (http::Uri otherwise accepts host-only and user@host authorities.)
+                let authority_form = uri.scheme().is_none()
+                    && uri.path_and_query().is_none()
+                    && uri
+                        .authority()
+                        .is_some_and(|a| a.port_u16().is_some() && !a.as_str().contains('@'));
+                if !authority_form {
+                    return Error::e_explain(
+                        InvalidHTTPHeader,
+                        format!("CONNECT requires an authority-form request-target, got {p}"),
+                    );
+                }
+                self.base.uri = uri;
+                self.raw_path_fallback = path.to_vec();
+                return Ok(());
+            }
+            // RFC 9112 §3.2.2: a server MUST accept the absolute-form request-target
+            // (e.g. "http://host/path"), which clients send through a forward proxy.
+            // Origin-form starts with '/', asterisk-form is '*'; anything else that
+            // parses as a Uri with a scheme is absolute-form. Keep scheme+authority
+            // on the Uri so the request-target host stays available to callers
+            // (§3.2.2), while raw_path() re-serializes origin-form on the wire.
+            if !p.starts_with('/') && p != "*" {
+                if let Ok(abs) = p.parse::<Uri>() {
+                    if abs.scheme().is_some() {
+                        // path_and_query() is valid origin-form except for the
+                        // no-path-with-query shape ("http://host?q" → "?q"); rewrite
+                        // it to "/?q" in place so both raw_path() and any later
+                        // rebuild from the Uri (e.g. H1->H2) see valid origin-form.
+                        // An empty path is already "/" (§3.2.1).
+                        self.base.uri = match abs.path_and_query().map(|pq| pq.as_str()) {
+                            Some(pq) if pq.starts_with('?') => {
+                                let mut origin = String::with_capacity(1 + pq.len());
+                                origin.push('/');
+                                origin.push_str(pq);
+                                let mut parts = abs.into_parts();
+                                parts.path_and_query =
+                                    Some(origin.parse().explain_err(InvalidHTTPHeader, |_| {
+                                        format!("invalid uri {p}")
+                                    })?);
+                                Uri::from_parts(parts).explain_err(InvalidHTTPHeader, |_| {
+                                    format!("invalid uri {p}")
+                                })?
+                            }
+                            _ => abs,
+                        };
+                        return Ok(());
+                    }
+                }
+            }
             let uri = Uri::builder()
                 .path_and_query(p)
                 .build()
                 .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
             self.base.uri = uri;
-            // keep raw_path empty, no need to store twice
+            // origin/asterisk-form: no fallback needed (cleared above)
         } else {
             // put a valid utf-8 path into base for read only access
             let lossy_str = String::from_utf8_lossy(path);
@@ -297,15 +364,18 @@ impl RequestHeader {
     pub fn raw_path(&self) -> &[u8] {
         if !self.raw_path_fallback.is_empty() {
             &self.raw_path_fallback
-        } else {
-            // Url should always be set
+        } else if let Some(pq) = self.base.uri.path_and_query() {
+            pq.as_str().as_bytes()
+        } else if self.base.method == Method::CONNECT {
+            // authority-form target set via set_uri() (which clears the fallback)
             self.base
                 .uri
-                .path_and_query()
-                .as_ref()
-                .unwrap()
-                .as_str()
-                .as_bytes()
+                .authority()
+                .map_or(b"/" as &[u8], |a| a.as_str().as_bytes())
+        } else {
+            // A Uri with no path-and-query (e.g. set via set_uri()); origin-form
+            // requires at least "/" (RFC 9112 §3.2.1).
+            b"/"
         }
     }
 
@@ -1028,6 +1098,187 @@ mod tests {
         req.set_uri(Uri::builder().path_and_query(new_path).build().unwrap());
         assert_eq!(new_path, req.uri.path_and_query().unwrap());
         assert_eq!(new_path.as_bytes(), req.raw_path());
+    }
+
+    #[test]
+    fn test_absolute_form_http() {
+        let req = RequestHeader::build("GET", b"http://host/path?query=1", None).unwrap();
+        assert_eq!("/path?query=1", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!("/path", req.uri.path());
+        assert_eq!(b"/path?query=1", req.raw_path());
+    }
+
+    #[test]
+    fn test_absolute_form_https() {
+        let req = RequestHeader::build("GET", b"https://example.com/a/b/c?d=e", None).unwrap();
+        assert_eq!("/a/b/c?d=e", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!("/a/b/c", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_no_path() {
+        let req = RequestHeader::build("GET", b"http://host", None).unwrap();
+        assert_eq!("/", req.uri.path());
+        assert_eq!(b"/", req.raw_path());
+    }
+
+    #[test]
+    fn test_absolute_form_root() {
+        let req = RequestHeader::build("GET", b"http://host/", None).unwrap();
+        assert_eq!("/", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_no_path_with_query() {
+        // "http://host?query" parses with path-and-query "?query" (no path); it is
+        // canonicalized to origin-form "/?query" on the stored Uri (not just on the
+        // wire) so a later rebuild from the Uri, e.g. H1->H2, stays valid.
+        let req = RequestHeader::build("GET", b"http://host?query=1", None).unwrap();
+        assert_eq!("/", req.uri.path());
+        assert_eq!(Some("query=1"), req.uri.query());
+        assert_eq!("/?query=1", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!(b"/?query=1", req.raw_path());
+    }
+
+    #[test]
+    fn test_absolute_form_retains_authority() {
+        // §3.2.2: a server uses the request-target host, so scheme+authority must
+        // remain reachable on the Uri while the wire target stays origin-form.
+        let req = RequestHeader::build("GET", b"http://host:8080/path?q=1", None).unwrap();
+        assert_eq!(Some("http"), req.uri.scheme_str());
+        assert_eq!(Some("host:8080"), req.uri.authority().map(|a| a.as_str()));
+        assert_eq!("/path", req.uri.path());
+        assert_eq!(b"/path?q=1", req.raw_path());
+    }
+
+    #[test]
+    fn test_connect_authority_form() {
+        // §3.2.3: authority-form is only used for CONNECT; the target reaches the
+        // tunnel destination verbatim while authority() stays reachable.
+        let req = RequestHeader::build("CONNECT", b"example.com:443", None).unwrap();
+        assert_eq!(b"example.com:443", req.raw_path());
+        assert_eq!(
+            Some("example.com:443"),
+            req.uri.authority().map(|a| a.as_str())
+        );
+    }
+
+    #[test]
+    fn test_connect_authority_form_default_port() {
+        // RFC 9112 §3.2.3 example: CONNECT www.example.com:80.
+        let req = RequestHeader::build("CONNECT", b"www.example.com:80", None).unwrap();
+        assert_eq!(b"www.example.com:80", req.raw_path());
+    }
+
+    #[test]
+    fn test_connect_malformed() {
+        // A CONNECT target that is not a valid authority is rejected.
+        assert!(RequestHeader::build("CONNECT", b"ht tp://x", None).is_err());
+    }
+
+    #[test]
+    fn test_connect_rejects_non_authority_form() {
+        // §3.2.3: authority-form is exactly uri-host ":" port. Origin-form,
+        // absolute-form, asterisk, a missing port, and userinfo are all invalid
+        // CONNECT targets even though http::Uri parses some of them as authorities.
+        assert!(RequestHeader::build("CONNECT", b"/x", None).is_err());
+        assert!(RequestHeader::build("CONNECT", b"http://host/x", None).is_err());
+        assert!(RequestHeader::build("CONNECT", b"*", None).is_err());
+        assert!(RequestHeader::build("CONNECT", b"example.com", None).is_err()); // no port
+        assert!(RequestHeader::build("CONNECT", b"user@localhost:3000", None).is_err()); // userinfo
+        assert!(RequestHeader::build("CONNECT", b"user:pass@host:8080", None).is_err());
+    }
+
+    #[test]
+    fn test_connect_ipv6_authority() {
+        // IPv6 host:port is valid authority-form and must still be accepted.
+        let req = RequestHeader::build("CONNECT", b"[::1]:443", None).unwrap();
+        assert_eq!(b"[::1]:443", req.raw_path());
+    }
+
+    #[test]
+    fn test_set_raw_path_clears_stale_connect_fallback() {
+        // Reusing a header: the CONNECT authority-form target must not survive into
+        // a subsequent origin-form request via a stale raw_path_fallback.
+        let mut req = RequestHeader::build("CONNECT", b"example.com:443", None).unwrap();
+        assert_eq!(b"example.com:443", req.raw_path());
+        req.set_method(Method::GET);
+        req.set_raw_path(b"/ok").unwrap();
+        assert_eq!(b"/ok", req.raw_path());
+        assert_eq!("/ok", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_set_raw_path_mutation() {
+        // The mutation path, not just construction via build().
+        let mut req = RequestHeader::build("GET", b"/original", None).unwrap();
+        assert_eq!("/original", req.uri.path());
+        req.set_raw_path(b"http://host/mutated?q=1").unwrap();
+        assert_eq!("/mutated?q=1", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!("/mutated", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_with_port() {
+        let req = RequestHeader::build("GET", b"http://host:8080/path", None).unwrap();
+        assert_eq!("/path", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_uppercase_scheme() {
+        // RFC 3986 §3.1: scheme is case-insensitive.
+        let req = RequestHeader::build("GET", b"HTTP://HOST/path", None).unwrap();
+        assert_eq!("/path", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_non_http_scheme() {
+        // scheme().is_some() admits any valid scheme, not just http/https.
+        let req = RequestHeader::build("GET", b"ftp://host/path", None).unwrap();
+        assert_eq!("/path", req.uri.path());
+    }
+
+    #[test]
+    fn test_origin_form_unchanged() {
+        let req = RequestHeader::build("GET", b"/path?q=1", None).unwrap();
+        assert_eq!("/path?q=1", req.uri.path_and_query().unwrap().as_str());
+    }
+
+    #[test]
+    fn test_origin_form_with_scheme_in_query() {
+        // An origin-form path whose query contains "://" must not be mistaken
+        // for absolute-form (guarded by the starts_with('/') fast path).
+        let req = RequestHeader::build("GET", b"/redir?url=http://other", None).unwrap();
+        assert_eq!(
+            "/redir?url=http://other",
+            req.uri.path_and_query().unwrap().as_str()
+        );
+    }
+
+    #[test]
+    fn test_asterisk_form_unchanged() {
+        let req = RequestHeader::build("OPTIONS", b"*", None).unwrap();
+        assert_eq!("*", req.uri.path_and_query().unwrap().as_str());
+    }
+
+    #[test]
+    fn test_absolute_form_malformed_empty_authority() {
+        // "http:///path" — empty authority. Not origin-form, and does not parse as
+        // a scheme-bearing absolute URI, so it falls through to path_and_query(),
+        // which rejects non-origin-form input (http >= 1.4.1, RFC 9112 §3.2).
+        assert!(RequestHeader::build("GET", b"http:///path", None).is_err());
+    }
+
+    #[test]
+    fn test_absolute_form_malformed_invalid_char() {
+        // "http://ho{st/path" — invalid authority character; Uri::parse() rejects it.
+        assert!(RequestHeader::build("GET", b"http://ho{st/path", None).is_err());
+    }
+
+    #[test]
+    fn test_absolute_form_malformed_no_authority_query() {
+        // "http://?q=1" — empty authority with query; Uri::parse() rejects it.
+        assert!(RequestHeader::build("GET", b"http://?q=1", None).is_err());
     }
 
     #[test]

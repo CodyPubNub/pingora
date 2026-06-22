@@ -2523,6 +2523,35 @@ mod test_sync {
         assert_eq!(b"Bar", headers[0].value);
     }
 
+    #[test]
+    fn test_absolute_form_and_connect_to_wire() {
+        // The request-line written to the upstream is built from raw_path():
+        // absolute-form is re-serialized as origin-form (RFC 9112 §3.2.2) and the
+        // CONNECT authority-form is sent verbatim (§3.2.3).
+        let request_line = |method: &str, target: &[u8]| -> String {
+            let req = RequestHeader::build(method, target, None).unwrap();
+            let wire = http_req_header_to_wire(&req).unwrap();
+            let line = wire.as_ref().split(|&b| b == b'\r').next().unwrap();
+            String::from_utf8(line.to_vec()).unwrap()
+        };
+
+        // §3.2.2 example request-target, forwarded by a server as origin-form.
+        assert_eq!(
+            "GET /pub/WWW/TheProject.html HTTP/1.1",
+            request_line("GET", b"http://www.example.org/pub/WWW/TheProject.html")
+        );
+        assert_eq!(
+            "GET /?q=1 HTTP/1.1",
+            request_line("GET", b"http://host?q=1")
+        );
+        assert_eq!("GET / HTTP/1.1", request_line("GET", b"http://host"));
+        // §3.2.3 example CONNECT request-target.
+        assert_eq!(
+            "CONNECT www.example.com:80 HTTP/1.1",
+            request_line("CONNECT", b"www.example.com:80")
+        );
+    }
+
     /// Deterministic, parser-independent test of the request-line delimiter
     /// guard. Testing it through `http_req_header_to_wire`/`RequestHeader` is
     /// unreliable because whether `set_raw_path` admits a delimiter byte depends
