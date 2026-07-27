@@ -505,8 +505,9 @@ pub struct Session {
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
     /// Request body buffered early (before upstream connection) for auth/routing decisions.
-    /// When set, body forwarding will use this instead of re-reading from downstream.
-    /// Use accessor methods: `get_buffered_body()`, `take_buffered_body()`, `set_buffered_body()`.
+    /// When set, body forwarding will use this instead of re-reading from downstream. It must
+    /// outlive the first attempt so a retry can replay it.
+    /// Use accessor methods: `get_buffered_body()`, `set_buffered_body()`.
     #[cfg(feature = "early_body_buffer")]
     buffered_request_body: Option<Bytes>,
     /// Whether body has been fully consumed for buffering.
@@ -832,14 +833,6 @@ impl Session {
     #[cfg(feature = "early_body_buffer")]
     pub fn get_buffered_body(&self) -> Option<&Bytes> {
         self.buffered_request_body.as_ref()
-    }
-
-    /// Takes ownership of the buffered request body, leaving `None` in its place.
-    ///
-    /// Use this when forwarding the body to upstream - takes the body once for sending.
-    #[cfg(feature = "early_body_buffer")]
-    pub fn take_buffered_body(&mut self) -> Option<Bytes> {
-        self.buffered_request_body.take()
     }
 
     /// Sets the buffered request body.
@@ -1879,17 +1872,17 @@ mod tests {
         }
 
         #[test]
-        fn test_take_buffered_body() {
+        fn test_buffered_body_survives_repeated_reads() {
             let mut session = create_test_session();
             let body = Bytes::from("test body");
 
             session.set_buffered_body(Some(body.clone()));
-            let taken = session.take_buffered_body();
 
-            assert_eq!(taken, Some(body));
-            assert!(session.get_buffered_body().is_none());
-            // is_body_buffered should remain true after take
-            assert!(session.is_body_buffered());
+            // Each upstream attempt reads the buffer; a retry must still find it there.
+            for _ in 0..3 {
+                assert_eq!(session.get_buffered_body(), Some(&body));
+                assert!(session.is_body_buffered());
+            }
         }
 
         #[test]
