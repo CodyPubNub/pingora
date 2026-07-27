@@ -102,11 +102,23 @@ where
             .downstream_session
             .as_custom_mut()
             .and_then(|c| c.take_custom_message_writer());
+        // Keep the reader in this caller so it is restored even if retryable
+        // upstream errors make try_join! cancel the downstream future.
+        let mut downstream_custom_message_reader = match session
+            .take_downstream_custom_message_reader(&mut downstream_custom_message_writer)
+        {
+            Ok(reader) => reader,
+            Err(e) => return (false, false, Some(e)),
+        };
 
         let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
         session.as_mut().enable_retry_buffering();
+
+        // Shared signal so the upstream half can distinguish an expected task-pipe
+        // closure (the downstream half finished and dropped rx) from an unexpected one.
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
 
         // start bi-directional streaming
         let ret = tokio::try_join!(
@@ -115,14 +127,25 @@ where
                 tx_downstream,
                 rx_upstream,
                 ctx,
-                &mut downstream_custom_message_writer
+                &mut downstream_custom_message_writer,
+                &mut downstream_custom_message_reader,
+                pipe_state.clone(),
             ),
-            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream),
+            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream, pipe_state),
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
                 match custom_session.restore_custom_message_writer(downstream_custom_message_writer)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, false, Some(e));
+                    }
+                }
+            }
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                match custom_session.restore_custom_message_reader(downstream_custom_message_reader)
                 {
                     Ok(_) => { /* continue */ }
                     Err(e) => {
@@ -195,6 +218,7 @@ where
         client_session: &mut HttpSessionV1,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -234,7 +258,26 @@ where
                             // So that this function could read the rest events from rx including
                             // the closure, then exit.
                             if result.is_err() && !client_session.was_upgraded() {
-                                return result.map(|_| upstream_can_reuse);
+                                if PipeState::is_downstream_complete(
+                                    pipe_state.load(Ordering::Acquire),
+                                ) {
+                                    // The downstream half finished the response by its own framing
+                                    // and dropped the task pipe, so this send failure is benign.
+                                    if response_done {
+                                        // The whole upstream response was already read off the
+                                        // socket. Keep looping so the request side can finish; the
+                                        // natural loop exit then decides reuse from both directions
+                                        // (the connection is reusable only if the request was also
+                                        // fully sent, which a premature response can leave undone).
+                                        continue;
+                                    }
+                                    // We stopped mid-response, so the upstream connection has
+                                    // unread bytes and is unsafe to reuse.
+                                    return Ok(false);
+                                }
+                                // The pipe closed but the downstream half did not signal completion:
+                                // this is an unexpected closure, so surface the original send error.
+                                return Err(result.expect_err("send failure already checked via is_err() above"));
                             }
                         },
                         Err(e) => {
@@ -299,7 +342,9 @@ where
         SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
-            // just drain, do we need to do anything else?
+            // Serving the cached response and discarding the upstream one; nothing
+            // is written downstream this round, so return None and let the caller
+            // continue.
             return Ok(None);
         }
 
@@ -362,6 +407,7 @@ where
 
     // todo use this function to replace bidirection_1to2()
     // returns whether this server (downstream) session can be reused
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_handle_downstream(
         &self,
         session: &mut Session,
@@ -369,6 +415,10 @@ where
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+        downstream_custom_message_reader: &mut Option<
+            Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+        >,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -380,16 +430,16 @@ where
             mut downstream_custom_write,
             downstream_custom_message_custom_forwarding,
             mut downstream_custom_message_inject_rx,
-            mut downstream_custom_message_reader,
         ) = if downstream_custom_message_writer.is_some() {
-            let reader = session.downstream_custom_message()?;
             let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
-            (true, true, Some(inject_tx), Some(inject_rx), reader)
+            (true, true, Some(inject_tx), Some(inject_rx))
         } else {
-            (false, false, None, None, None)
+            (false, false, None, None)
         };
 
         if let Some(custom_forwarding) = downstream_custom_message_custom_forwarding {
+            // Custom handles are owned by the caller so an early error here still
+            // lets the caller restore them before retrying another upstream.
             self.inner
                 .custom_forwarding(session, ctx, None, custom_forwarding)
                 .await?;
@@ -664,10 +714,14 @@ where
                 // "Gate" branch: ready(()) resolves immediately, so the guard controls
                 // whether we enter. This is not a busy-loop because every path through
                 // the inner select either (a) drains all pending tasks via
-                // write_downstream_proxy_tasks (making the guard false), (b) stores an
-                // upstream task in next_upstream_task (making the guard false), or
-                // (c) blocks on real I/O inside the nested select.
-                _ = std::future::ready(()), if session.has_pending_downstream_tasks() && next_upstream_task.is_none() => {
+                // write_downstream_proxy_tasks (making the guard false), (b) observes a
+                // downstream write error (making downstream_state errored and the guard false),
+                // (c) stores an upstream task in next_upstream_task (making the guard false), or
+                // (d) blocks on real I/O inside the nested select.
+                _ = std::future::ready(()),
+                    if !downstream_state.is_errored()
+                        && session.has_pending_downstream_tasks()
+                        && next_upstream_task.is_none() => {
                     tokio::select! {
                         // Try to write downstream proxy tasks (cancel-safe)
                         write_result = session.write_downstream_proxy_tasks() => {
@@ -762,14 +816,6 @@ where
             }
         }
 
-        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
-                custom_session
-                    .restore_custom_message_reader(downstream_custom_message_reader)
-                    .expect("downstream restore_custom_message_reader should be empty");
-            }
-        }
-
         let mut reuse_downstream = !downstream_state.is_errored();
         if reuse_downstream {
             match session.as_mut().finish_body().await {
@@ -782,6 +828,9 @@ where
                 }
             }
         }
+        // Signal the upstream half that the downstream half completed cleanly before
+        // dropping rx, so a resulting task-pipe closure is treated as benign.
+        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
         Ok(reuse_downstream)
     }
 

@@ -46,7 +46,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -77,6 +77,9 @@ use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
 const TASK_BUFFER_SIZE: usize = 4;
+
+type DownstreamCustomMessageReader =
+    Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>;
 
 mod proxy_cache;
 mod proxy_common;
@@ -736,7 +739,7 @@ impl Session {
     /// downstream module filters. This allows decoupling cache writes from
     /// downstream writes.
     ///
-    /// Only works with sessions that support the proxy task API (currently H1).
+    /// Only works with sessions that support the proxy task API.
     ///
     /// # Panics
     /// Panics if the session doesn't support the proxy task API.
@@ -883,6 +886,7 @@ impl Session {
             upstream_compression: ResponseCompressionCtx::new(0, false, false),
             ignore_downstream_range: false,
             upstream_headers_mutated_for_cache: false,
+            upstream_h1_upgrade_status_mismatch: false,
             subrequest_ctx: None,
             subrequest_spawner: None,
             downstream_modules_ctx: HttpModuleCtx::empty(),
@@ -896,11 +900,7 @@ impl Session {
         }
     }
 
-    pub fn downstream_custom_message(
-        &mut self,
-    ) -> Result<
-        Option<Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>>,
-    > {
+    pub fn downstream_custom_message(&mut self) -> Result<Option<DownstreamCustomMessageReader>> {
         if let Some(custom_session) = self.downstream_session.as_custom_mut() {
             custom_session
                 .take_custom_message_reader()
@@ -912,6 +912,31 @@ impl Session {
         } else {
             Ok(None)
         }
+    }
+
+    fn take_downstream_custom_message_reader(
+        &mut self,
+        downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+    ) -> Result<Option<DownstreamCustomMessageReader>> {
+        if downstream_custom_message_writer.is_none() {
+            return Ok(None);
+        }
+
+        let Some(custom_session) = self.downstream_session.as_custom_mut() else {
+            return Ok(None);
+        };
+
+        let Some(reader) = custom_session.take_custom_message_reader() else {
+            if let Some(writer) = downstream_custom_message_writer.take() {
+                custom_session.restore_custom_message_writer(writer)?;
+            }
+            return Err(Error::explain(
+                ReadError,
+                "can't extract custom reader from downstream",
+            ));
+        };
+
+        Ok(Some(reader))
     }
 }
 
