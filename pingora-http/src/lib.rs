@@ -30,7 +30,7 @@ use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
 pub use http::method::Method;
 pub use http::status::StatusCode;
@@ -68,7 +68,15 @@ pub enum HeaderNameVariant<'a> {
 /// It also preserves request path even if it is not UTF-8.
 ///
 /// [RequestHeader] implements [Deref] for [http::request::Parts] so it can be used as it in most
-/// places.
+/// places. Mutable access to the underlying parts is intentionally not provided because header and
+/// URI mutations must use methods on [RequestHeader] to preserve its internal state.
+///
+/// ```compile_fail
+/// use pingora_http::RequestHeader;
+///
+/// let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+/// request.headers.remove("user-agent");
+/// ```
 #[derive(Debug)]
 pub struct RequestHeader {
     base: ReqParts,
@@ -91,12 +99,6 @@ impl Deref for RequestHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
-    }
-}
-
-impl DerefMut for RequestHeader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.base
     }
 }
 
@@ -238,6 +240,11 @@ impl RequestHeader {
         }
 
         Ok(())
+    }
+
+    /// Return mutable access to the request extensions.
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.base.extensions
     }
 
     /// Set the request method
@@ -434,7 +441,15 @@ impl From<RequestHeader> for ReqParts {
 ///
 /// This type is similar to [http::response::Parts] but preserves header name case.
 /// [ResponseHeader] implements [Deref] for [http::response::Parts] so it can be used as it in most
-/// places.
+/// places. Mutable access to the underlying parts is intentionally not provided because header
+/// mutations must use methods on [ResponseHeader] to preserve its internal state.
+///
+/// ```compile_fail
+/// use pingora_http::ResponseHeader;
+///
+/// let mut response = ResponseHeader::build(200, None).unwrap();
+/// response.headers.remove("server");
+/// ```
 #[derive(Debug)]
 pub struct ResponseHeader {
     base: RespParts,
@@ -455,12 +470,6 @@ impl Deref for ResponseHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
-    }
-}
-
-impl DerefMut for ResponseHeader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.base
     }
 }
 
@@ -633,6 +642,11 @@ impl ResponseHeader {
         Ok(())
     }
 
+    /// Return mutable access to the response extensions.
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.base.extensions
+    }
+
     /// Set the status code
     pub fn set_status(&mut self, status: impl TryInto<StatusCode>) -> Result<()> {
         self.base.status = status
@@ -742,10 +756,19 @@ fn append_header_value<T>(
         .or_err(InvalidHTTPHeader, "invalid header name")?;
     // store the original case in the map
     if let Some(name_map) = name_map {
-        name_map.append(header_name.clone(), case_header_name);
+        // Use the non-panicking `try_append`: the infallible `append` calls
+        // `.expect("size overflows MAX_SIZE")` internally, which would abort the
+        // process if the case map ever exceeded `http`'s `MAX_SIZE` (1 << 15).
+        name_map
+            .try_append(header_name.clone(), case_header_name)
+            .or_err(InvalidHTTPHeader, "header name map size overflows MAX_SIZE")?;
     }
 
-    Ok(value_map.append(header_name, value))
+    // Non-panicking `try_append` for the same reason as the case map above.
+    value_map.try_append(header_name, value).or_err(
+        InvalidHTTPHeader,
+        "header value map size overflows MAX_SIZE",
+    )
 }
 
 #[inline]
@@ -1279,6 +1302,16 @@ mod tests {
     fn test_absolute_form_malformed_no_authority_query() {
         // "http://?q=1" — empty authority with query; Uri::parse() rejects it.
         assert!(RequestHeader::build("GET", b"http://?q=1", None).is_err());
+    }
+
+    #[test]
+    fn test_authority_form_raw_path() {
+        let mut req = RequestHeader::new_no_case(None);
+        req.set_method(Method::CONNECT);
+        req.set_uri(Uri::builder().authority("pingora.org:443").build().unwrap());
+
+        assert!(req.uri.path_and_query().is_none());
+        assert_eq!(b"pingora.org:443", req.raw_path());
     }
 
     #[test]
