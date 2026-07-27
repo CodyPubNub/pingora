@@ -2863,6 +2863,46 @@ mod tests_stream {
         assert_eq!(input3, http_stream.get_body(&res));
     }
 
+    #[tokio::test]
+    async fn read_absolute_form_request_target() {
+        init_log();
+        // RFC 9112 §3.2.2: absolute-form must be accepted from the wire, and
+        // re-serialized as origin-form.
+        let input = b"GET http://pingora.org:8080/a?q=b HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(&b"/a?q=b"[..], http_stream.get_path());
+        let uri = &http_stream.req_header().uri;
+        assert_eq!(
+            Some("pingora.org:8080"),
+            uri.authority().map(|a| a.as_str())
+        );
+        assert_eq!(Some("http"), uri.scheme_str());
+    }
+
+    #[tokio::test]
+    async fn read_authority_form_request_target() {
+        init_log();
+        // RFC 9112 §3.2.3: authority-form reaches the tunnel destination verbatim.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(&b"pingora.org:443"[..], http_stream.get_path());
+        assert_eq!(Some(&Method::CONNECT), http_stream.get_method());
+    }
+
+    #[tokio::test]
+    async fn read_malformed_authority_form_request_target() {
+        init_log();
+        // A CONNECT target that is not uri-host ":" port is rejected, not tunneled.
+        let input = b"CONNECT [gg]:443 HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        assert!(http_stream.read_request().await.is_err());
+    }
+
     #[test]
     fn escape_illegal() {
         init_log();

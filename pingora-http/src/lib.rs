@@ -265,89 +265,14 @@ impl RequestHeader {
     ///
     /// This API is to allow supporting non UTF-8 cases.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
-        // Drop any fallback left by a prior path; only the CONNECT and non-UTF-8
-        // branches below re-set it. Without this, reusing a header (e.g. mutating a
-        // CONNECT request into a normal one) would serialize the stale target.
-        self.raw_path_fallback.clear();
-        if let Ok(p) = std::str::from_utf8(path) {
-            // RFC 9112 §3.2.3: the authority-form request-target ("host[:port]") is
-            // used only for CONNECT. It is opaque to routing and must reach the
-            // tunnel destination verbatim, so keep the parsed Uri (for authority()
-            // access) and re-serialize the original bytes via raw_path(). Reject
-            // anything that is not authority-form: a scheme, path, or query means
-            // it is not a valid CONNECT target.
-            if self.base.method == Method::CONNECT {
-                let uri = p
-                    .parse::<Uri>()
-                    .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {p}"))?;
-                // §3.2.3 authority-form is exactly uri-host ":" port: no scheme,
-                // path, or query, and an authority that has a port and no userinfo.
-                // (http::Uri otherwise accepts host-only and user@host authorities.)
-                let authority_form = uri.scheme().is_none()
-                    && uri.path_and_query().is_none()
-                    && uri
-                        .authority()
-                        .is_some_and(|a| a.port_u16().is_some() && !a.as_str().contains('@'));
-                if !authority_form {
-                    return Error::e_explain(
-                        InvalidHTTPHeader,
-                        format!("CONNECT requires an authority-form request-target, got {p}"),
-                    );
-                }
-                self.base.uri = uri;
-                self.raw_path_fallback = path.to_vec();
-                return Ok(());
-            }
-            // RFC 9112 §3.2.2: a server MUST accept the absolute-form request-target
-            // (e.g. "http://host/path"), which clients send through a forward proxy.
-            // Origin-form starts with '/', asterisk-form is '*'; anything else that
-            // parses as a Uri with a scheme is absolute-form. Keep scheme+authority
-            // on the Uri so the request-target host stays available to callers
-            // (§3.2.2), while raw_path() re-serializes origin-form on the wire.
-            if !p.starts_with('/') && p != "*" {
-                if let Ok(abs) = p.parse::<Uri>() {
-                    if abs.scheme().is_some() {
-                        // path_and_query() is valid origin-form except for the
-                        // no-path-with-query shape ("http://host?q" → "?q"); rewrite
-                        // it to "/?q" in place so both raw_path() and any later
-                        // rebuild from the Uri (e.g. H1->H2) see valid origin-form.
-                        // An empty path is already "/" (§3.2.1).
-                        self.base.uri = match abs.path_and_query().map(|pq| pq.as_str()) {
-                            Some(pq) if pq.starts_with('?') => {
-                                let mut origin = String::with_capacity(1 + pq.len());
-                                origin.push('/');
-                                origin.push_str(pq);
-                                let mut parts = abs.into_parts();
-                                parts.path_and_query =
-                                    Some(origin.parse().explain_err(InvalidHTTPHeader, |_| {
-                                        format!("invalid uri {p}")
-                                    })?);
-                                Uri::from_parts(parts).explain_err(InvalidHTTPHeader, |_| {
-                                    format!("invalid uri {p}")
-                                })?
-                            }
-                            _ => abs,
-                        };
-                        return Ok(());
-                    }
-                }
-            }
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
-            self.base.uri = uri;
-            // origin/asterisk-form: no fallback needed (cleared above)
-        } else {
-            // put a valid utf-8 path into base for read only access
-            let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
-            self.base.uri = uri;
-            self.raw_path_fallback = path.to_vec();
-        }
+        // Both values are computed before either is stored: a rejected target must
+        // leave the existing one intact.
+        let (uri, raw_path_fallback) = parse_request_target(&self.base.method, path)?;
+        self.base.uri = uri;
+        // Only the CONNECT and non-UTF-8 forms need a fallback; the others replace it
+        // with an empty vec so a reused header (e.g. a CONNECT mutated into a normal
+        // request) cannot serialize the stale target.
+        self.raw_path_fallback = raw_path_fallback;
         Ok(())
     }
 
@@ -690,6 +615,116 @@ impl ResponseHeader {
     pub fn set_content_length(&mut self, len: usize) -> Result<()> {
         self.insert_header(http::header::CONTENT_LENGTH, len)
     }
+}
+
+/// `IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )` (RFC 3986 §3.2.2),
+/// without the enclosing brackets.
+fn is_ipv_future(literal: &str) -> bool {
+    let Some(rest) = literal.strip_prefix(['v', 'V']) else {
+        return false;
+    };
+    let Some((version, address)) = rest.split_once('.') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_hexdigit())
+        && !address.is_empty()
+        && address
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&b))
+}
+
+/// Whether `host` is a valid RFC 3986 §3.2.2 uri-host: a bracketed IP-literal
+/// (IPv6address or IPvFuture), or a reg-name (which subsumes IPv4address).
+///
+/// `http::Uri` does not check this on its own — it accepts an empty host and any
+/// bracketed content, including `[]` and `[gg]` — so authority-form validation cannot
+/// delegate to it. Conversely, pct-encoded reg-names are rejected before reaching
+/// here, so this accepts a subset of reg-name rather than the full grammar.
+fn is_uri_host(host: &str) -> bool {
+    if let Some(literal) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return literal.parse::<std::net::Ipv6Addr>().is_ok() || is_ipv_future(literal);
+    }
+    // reg-name = *( unreserved / pct-encoded / sub-delims ), minus pct-encoded, plus
+    // non-empty: an authority-form target must name a tunnel destination.
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&b))
+}
+
+/// Parse a request-target (RFC 9112 §3.2) into the [Uri] to store and the raw bytes
+/// [RequestHeader::raw_path()] should re-serialize (empty when the `Uri` round-trips).
+fn parse_request_target(method: &Method, path: &[u8]) -> Result<(Uri, Vec<u8>)> {
+    let Ok(p) = std::str::from_utf8(path) else {
+        // put a valid utf-8 path into base for read only access
+        let lossy_str = String::from_utf8_lossy(path);
+        let uri = Uri::builder()
+            .path_and_query(lossy_str.as_ref())
+            .build()
+            .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {lossy_str}"))?;
+        return Ok((uri, path.to_vec()));
+    };
+
+    // RFC 9112 §3.2.3: the authority-form request-target ("host:port") is used only
+    // for CONNECT. It is opaque to routing and must reach the tunnel destination
+    // verbatim, so keep the parsed Uri (for authority() access) and re-serialize the
+    // original bytes via raw_path().
+    if *method == Method::CONNECT {
+        let uri = p
+            .parse::<Uri>()
+            .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {p}"))?;
+        // §3.2.3 authority-form is exactly uri-host ":" port: no scheme, path or
+        // query, and an authority of a valid host and port with no userinfo.
+        let authority_form = uri.scheme().is_none()
+            && uri.path_and_query().is_none()
+            && uri.authority().is_some_and(|a| {
+                a.port_u16().is_some() && !a.as_str().contains('@') && is_uri_host(a.host())
+            });
+        if !authority_form {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                format!("CONNECT requires an authority-form request-target, got {p}"),
+            );
+        }
+        return Ok((uri, path.to_vec()));
+    }
+
+    // RFC 9112 §3.2.2: a server MUST accept the absolute-form request-target (e.g.
+    // "http://host/path"), which clients send through a forward proxy. Origin-form
+    // starts with '/', asterisk-form is '*'; anything else that parses as a Uri with a
+    // scheme is absolute-form. Keep scheme+authority on the Uri so the request-target
+    // host stays available to callers (§3.2.2), while raw_path() re-serializes
+    // origin-form on the wire.
+    if !p.starts_with('/') && p != "*" {
+        if let Some(abs) = p.parse::<Uri>().ok().filter(|u| u.scheme().is_some()) {
+            // path_and_query() is valid origin-form except for the no-path-with-query
+            // shape ("http://host?q" → "?q"); rewrite it to "/?q" in place so both
+            // raw_path() and any later rebuild from the Uri (e.g. H1->H2) see valid
+            // origin-form. An empty path is already "/" (§3.2.1).
+            let uri = match abs.path_and_query().map(|pq| pq.as_str()) {
+                Some(pq) if pq.starts_with('?') => {
+                    let origin = format!("/{pq}");
+                    let mut parts = abs.into_parts();
+                    parts.path_and_query = Some(
+                        origin
+                            .parse()
+                            .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {p}"))?,
+                    );
+                    Uri::from_parts(parts)
+                        .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {p}"))?
+                }
+                _ => abs,
+            };
+            return Ok((uri, vec![]));
+        }
+    }
+
+    let uri = Uri::builder()
+        .path_and_query(p)
+        .build()
+        .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {p}"))?;
+    Ok((uri, vec![]))
 }
 
 fn clone_req_parts(me: &ReqParts) -> ReqParts {
@@ -1213,10 +1248,71 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_rejects_malformed_host() {
+        // http::Uri parses all of these as an authority with a port, so uri-host has
+        // to be validated separately.
+        assert!(RequestHeader::build("CONNECT", b":443", None).is_err()); // empty host
+        assert!(RequestHeader::build("CONNECT", b"[]:443", None).is_err()); // empty literal
+        assert!(RequestHeader::build("CONNECT", b"[gg]:443", None).is_err()); // not an IP
+        assert!(RequestHeader::build("CONNECT", b"[::1", None).is_err()); // unclosed
+        assert!(RequestHeader::build("CONNECT", b"ho|st:443", None).is_err()); // not reg-name
+    }
+
+    #[test]
+    fn test_connect_rejects_malformed_ipv_future_host() {
+        // Missing version, non-HEXDIG version, no '.', and empty address. http::Uri
+        // passes any bracketed content through, so the grammar is checked here.
+        assert!(RequestHeader::build("CONNECT", b"[v.x]:443", None).is_err());
+        assert!(RequestHeader::build("CONNECT", b"[vzz.x]:443", None).is_err());
+        assert!(RequestHeader::build("CONNECT", b"[v7x]:443", None).is_err());
+        assert!(RequestHeader::build("CONNECT", b"[v7.]:443", None).is_err());
+    }
+
+    #[test]
+    fn test_connect_accepts_ipv_future_authority() {
+        // RFC 3986 §3.2.2: IP-literal = "[" ( IPv6address / IPvFuture ) "]".
+        for target in [&b"[v7.x]:443"[..], b"[vF.a:b~!$&'()*+,;=]:8443"] {
+            let req = RequestHeader::build("CONNECT", target, None).unwrap();
+            assert_eq!(target, req.raw_path());
+        }
+    }
+
+    #[test]
     fn test_connect_ipv6_authority() {
         // IPv6 host:port is valid authority-form and must still be accepted.
         let req = RequestHeader::build("CONNECT", b"[::1]:443", None).unwrap();
         assert_eq!(b"[::1]:443", req.raw_path());
+        let req = RequestHeader::build("CONNECT", b"[2001:db8::1]:8443", None).unwrap();
+        assert_eq!(b"[2001:db8::1]:8443", req.raw_path());
+    }
+
+    #[test]
+    fn test_connect_accepts_reg_name_and_ipv4_hosts() {
+        // reg-name subsumes IPv4address and permits sub-delims.
+        for target in [
+            &b"127.0.0.1:443"[..],
+            b"sub.example.com:8080",
+            b"host-with-dash:1",
+            b"a_b:443",
+        ] {
+            let req = RequestHeader::build("CONNECT", target, None).unwrap();
+            assert_eq!(target, req.raw_path());
+        }
+    }
+
+    #[test]
+    fn test_set_raw_path_error_preserves_target() {
+        // A rejected request-target must not mutate the header. The non-UTF-8 target
+        // is the sharpest case: a partial update would leave the lossy Uri behind
+        // with no fallback to restore it.
+        let mut req = RequestHeader::build("GET", b"/before-\xff", None).unwrap();
+        assert!(req.set_raw_path(b"not-origin-form").is_err());
+        assert_eq!(b"/before-\xff", req.raw_path());
+
+        let mut req = RequestHeader::build("CONNECT", b"example.com:443", None).unwrap();
+        assert!(req.set_raw_path(b"[gg]:443").is_err());
+        assert_eq!(b"example.com:443", req.raw_path());
+        assert_eq!("example.com:443", req.uri.authority().unwrap().as_str());
     }
 
     #[test]
