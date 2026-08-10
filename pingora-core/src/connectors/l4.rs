@@ -313,7 +313,7 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
         connect_uds(&proxy.next_hop)
             .await
             .or_err_with(ConnectError, || {
-                format!("CONNECT proxy connect() error to {:?}", &proxy.next_hop)
+                format!("CONNECT proxy connect() error to {:?}", proxy.next_hop)
             })?
             .into(),
     );
@@ -346,20 +346,21 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
 mod tests {
     use super::*;
     use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
-    use pingora_error::ErrorType;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
-    use tokio::time::sleep;
+    use std::time::Duration;
 
     #[cfg(target_os = "linux")]
     async fn wait_for_peer<P>(peer: &P)
     where
         P: Peer + Send + Sync,
     {
-        use ErrorType as E;
+        use pingora_error::ErrorType as E;
+        use std::time::Instant;
+        use tokio::time::sleep;
+
         let start = Instant::now();
         let mut res = connect(peer, None).await;
         let mut delay = Duration::from_millis(5);
