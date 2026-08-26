@@ -65,6 +65,8 @@ use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
+#[cfg(feature = "early_body_buffer")]
+use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
@@ -909,30 +911,15 @@ impl Session {
     pub fn new_h1_with_http_session(
         http_session: pingora_core::protocols::http::v1::server::HttpSession,
     ) -> Self {
-        use pingora_cache::HttpCache;
-        use pingora_core::protocols::http::compression::ResponseCompressionCtx;
         use pingora_core::protocols::http::ServerSession;
 
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        Session {
-            downstream_session: Box::new(ServerSession::H1(http_session)),
-            cache: HttpCache::new(),
-            upstream_compression: ResponseCompressionCtx::new(0, false, false),
-            ignore_downstream_range: false,
-            upstream_headers_mutated_for_cache: false,
-            h1_upgrade_request_status: H1UpgradeRequestStatus::default(),
-            subrequest_ctx: None,
-            subrequest_spawner: None,
-            downstream_modules_ctx: HttpModuleCtx::empty(),
+        Self::new(
+            Box::new(ServerSession::H1(http_session)),
+            &HttpModules::new(),
             #[cfg(feature = "upstream_modules")]
-            upstream_modules_ctx: HttpModuleCtx::empty(),
-            upstream_body_bytes_received: 0,
-            downstream_task_seen_upgraded: false,
-            upstream_write_pending_time: Duration::ZERO,
-            shutdown_flag,
-            buffered_request_body: None,
-            body_buffered: false,
-        }
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     pub fn downstream_custom_message(&mut self) -> Result<Option<DownstreamCustomMessageReader>> {
@@ -1416,13 +1403,13 @@ where
             return Ok(());
         }
 
-        let content_length = session
-            .downstream_session
-            .req_header()
-            .headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
+        let content_length = header_value_content_length(
+            session
+                .downstream_session
+                .req_header()
+                .headers
+                .get(header::CONTENT_LENGTH),
+        );
 
         // fail fast: reject before reading if Content-Length exceeds limit
         if let Some(cl) = content_length {
@@ -1438,7 +1425,7 @@ where
         }
 
         // Content-Length: 0 means no body; for all other cases (no Content-Length,
-        // Transfer-Encoding, HTTP/2) attempt to read. read_body_or_idle returns
+        // Transfer-Encoding, HTTP/2) attempt to read. read_request_body returns
         // None immediately if there's nothing.
         if content_length == Some(0) {
             session.mark_body_buffered();
@@ -1451,7 +1438,7 @@ where
         // read body chunks until end of stream
         loop {
             let body_chunk: Option<Bytes> =
-                match session.downstream_session.read_body_or_idle(false).await {
+                match session.downstream_session.read_request_body().await {
                     Ok(chunk) => chunk,
                     Err(e) => return Err(e.into_down()),
                 };
@@ -1488,15 +1475,17 @@ where
             }
         }
 
-        // combine all chunks into a single Bytes buffer
-        if total_size > 0 {
+        if total_size == 0 {
+            session.mark_body_buffered();
+        } else if body_parts.len() == 1 {
+            // common case: a single chunk can be moved out without a second copy
+            session.set_buffered_body(body_parts.pop());
+        } else {
             let mut combined = bytes::BytesMut::with_capacity(total_size);
             for part in body_parts {
                 combined.extend_from_slice(&part);
             }
             session.set_buffered_body(Some(combined.freeze()));
-        } else {
-            session.mark_body_buffered();
         }
 
         Ok(())

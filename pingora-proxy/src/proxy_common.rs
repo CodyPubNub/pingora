@@ -242,9 +242,6 @@ pub(crate) enum DownstreamStateMachine {
     Reading,
     /// no more data to read
     ReadingFinished,
-    /// body was pre-buffered before upstream connection, skip all downstream polling
-    #[cfg(feature = "early_body_buffer")]
-    PreBuffered,
     /// downstream is already errored or closed
     Errored,
 }
@@ -261,14 +258,7 @@ impl DownstreamStateMachine {
 
     // Can call read() to read more data or wait on closing
     pub fn can_poll(&self) -> bool {
-        #[cfg(feature = "early_body_buffer")]
-        {
-            !matches!(self, Self::Errored | Self::PreBuffered)
-        }
-        #[cfg(not(feature = "early_body_buffer"))]
-        {
-            !matches!(self, Self::Errored)
-        }
+        !matches!(self, Self::Errored)
     }
 
     pub fn is_reading(&self) -> bool {
@@ -320,7 +310,7 @@ pub(crate) fn select_upstream_body_source(
     fallback: impl FnOnce() -> (bool, Option<bytes::Bytes>),
 ) -> (DownstreamStateMachine, Option<bytes::Bytes>) {
     if is_body_buffered {
-        (DownstreamStateMachine::PreBuffered, buffered_body)
+        (DownstreamStateMachine::ReadingFinished, buffered_body)
     } else {
         let (is_body_done, retry_buffer) = fallback();
         (DownstreamStateMachine::new(is_body_done), retry_buffer)
@@ -660,23 +650,24 @@ mod tests {
                 let (state, buffer) = select_upstream_body_source(true, Some(body.clone()), || {
                     panic!("must not consult downstream when a body was pre-buffered")
                 });
-                assert!(matches!(state, DownstreamStateMachine::PreBuffered));
+                assert!(matches!(state, DownstreamStateMachine::ReadingFinished));
                 assert!(
-                    !state.can_poll(),
-                    "pre-buffered body must not poll downstream"
+                    state.can_poll(),
+                    "finished bodies must still poll for downstream close"
                 );
                 assert_eq!(buffer, Some(body.clone()));
             }
         }
 
-        /// A request marked buffered but carrying no body still skips downstream polling, so an
-        /// empty body is never mistaken for "read it from downstream".
+        /// A request marked buffered but carrying no body is finished while still polling for
+        /// downstream close.
         #[test]
-        fn prebuffered_empty_body_still_skips_downstream() {
+        fn prebuffered_empty_body_is_finished() {
             let (state, buffer) = select_upstream_body_source(true, None, || {
                 panic!("must not consult downstream when the body was marked buffered")
             });
-            assert!(matches!(state, DownstreamStateMachine::PreBuffered));
+            assert!(matches!(state, DownstreamStateMachine::ReadingFinished));
+            assert!(state.can_poll());
             assert_eq!(buffer, None);
         }
 

@@ -273,9 +273,10 @@ pub trait ProxyHttp {
 
     /// Handle each chunk of request body during early buffering.
     ///
-    /// This is called during [`buffer_request_body_early()`] for each body chunk, **before**
-    /// [`Self::request_filter()`] and [`Self::upstream_peer()`]. Use this for processing
-    /// that must happen before header filters run (e.g., streaming decompression).
+    /// This is called while the body is buffered early (enabled by
+    /// [`Self::early_request_body_buffer_limit()`]) for each body chunk, **before**
+    /// [`Self::request_filter()`] and [`Self::upstream_peer()`]. Use this for processing that must
+    /// happen before header filters run (e.g., streaming decompression).
     ///
     /// Unlike [`Self::request_body_filter()`], this callback explicitly runs before any
     /// header-phase filters, so it should not depend on state set by [`Self::request_filter()`].
