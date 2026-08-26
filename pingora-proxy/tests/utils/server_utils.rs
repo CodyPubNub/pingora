@@ -23,7 +23,7 @@ use once_cell::sync::Lazy;
 use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
-use pingora_cache::key::{CompactCacheKey, HashBinary};
+use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
@@ -527,11 +527,11 @@ impl Storage for FinishFailCache {
 
     async fn purge(
         &'static self,
-        _key: &CompactCacheKey,
+        _target: pingora_cache::PurgeTarget<'_>,
         _purge_type: PurgeType,
         _trace: &pingora_cache::trace::SpanHandle,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        Ok(pingora_cache::storage::PurgeOutcome::NotFound)
     }
 
     async fn update_meta(
@@ -567,6 +567,17 @@ pub struct CacheCTX {
 }
 
 pub struct ExampleProxyCache {}
+
+static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the cache proxy has reported a downstream error that it ignored in order
+/// to let a cache fill finish.
+///
+/// Tests use this to wait for the proxy to actually observe a downstream error instead of
+/// sleeping for an arbitrary duration.
+pub fn downstream_cache_warn_log_calls() -> usize {
+    DOWNSTREAM_CACHE_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
@@ -966,6 +977,20 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
         session.req_header().method == "PURGE"
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if context == ProxyWarnLogContext::DownstreamCache {
+            DOWNSTREAM_CACHE_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // only observing, keep the logging behavior unchanged
+        false
     }
 }
 
