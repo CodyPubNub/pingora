@@ -23,6 +23,7 @@
 #![cfg(feature = "early_body_buffer")]
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use pingora_core::prelude::HttpPeer;
 use pingora_core::server::configuration::ServerConf;
 
@@ -186,6 +187,8 @@ async fn spawn_origin(recorder: Arc<Recorder>, fail_first: bool) -> u16 {
 struct EarlyBufferProxy {
     origin_port: u16,
     limit: usize,
+    buffer_in_request_filter: bool,
+    body_filter_calls: Arc<AtomicUsize>,
     max_attempts: Arc<AtomicUsize>,
 }
 
@@ -204,7 +207,36 @@ impl ProxyHttp for EarlyBufferProxy {
     }
 
     fn early_request_body_buffer_limit(&self, _session: &Session, _ctx: &Ctx) -> Option<usize> {
-        Some(self.limit)
+        (!self.buffer_in_request_filter).then_some(self.limit)
+    }
+
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Ctx) -> Result<bool> {
+        if !self.buffer_in_request_filter {
+            return Ok(false);
+        }
+
+        let mut body = BytesMut::new();
+        while let Some(chunk) = session.downstream_session.read_request_body().await? {
+            body.extend_from_slice(&chunk);
+            if session.downstream_session.is_body_done() {
+                break;
+            }
+        }
+        session.set_buffered_body(Some(body.freeze()));
+        Ok(false)
+    }
+
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Ctx,
+    ) -> Result<()> {
+        if body.is_some() {
+            self.body_filter_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
@@ -224,13 +256,23 @@ impl ProxyHttp for EarlyBufferProxy {
 
 struct Harness {
     proxy_port: u16,
+    body_filter_calls: Arc<AtomicUsize>,
     max_attempts: Arc<AtomicUsize>,
     recorder: Arc<Recorder>,
 }
 
 async fn start_harness(limit: usize, fail_first: bool) -> Harness {
+    start_harness_with_mode(limit, fail_first, false).await
+}
+
+async fn start_harness_with_mode(
+    limit: usize,
+    fail_first: bool,
+    buffer_in_request_filter: bool,
+) -> Harness {
     let recorder = Arc::new(Recorder::default());
     let origin_port = spawn_origin(recorder.clone(), fail_first).await;
+    let body_filter_calls = Arc::new(AtomicUsize::new(0));
     let max_attempts = Arc::new(AtomicUsize::new(0));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -238,6 +280,7 @@ async fn start_harness(limit: usize, fail_first: bool) -> Harness {
     drop(listener);
 
     let app_attempts = max_attempts.clone();
+    let app_body_filter_calls = body_filter_calls.clone();
     std::thread::spawn(move || {
         let mut server = pingora_core::server::Server::new(None).unwrap();
         server.bootstrap();
@@ -247,6 +290,8 @@ async fn start_harness(limit: usize, fail_first: bool) -> Harness {
             EarlyBufferProxy {
                 origin_port,
                 limit,
+                buffer_in_request_filter,
+                body_filter_calls: app_body_filter_calls,
                 max_attempts: app_attempts,
             },
         );
@@ -271,9 +316,46 @@ async fn start_harness(limit: usize, fail_first: bool) -> Harness {
 
     Harness {
         proxy_port,
+        body_filter_calls,
         max_attempts,
         recorder,
     }
+}
+
+/// Applications may need header-phase policy checks before buffering, so they can leave
+/// `early_request_body_buffer_limit()` disabled, consume the body in `request_filter()`, and
+/// provide the verified body through `Session::set_buffered_body()`. That application-supplied
+/// body must follow the same forwarding, filtering, and retry path as an automatically buffered
+/// body.
+#[tokio::test]
+async fn application_buffered_body_is_filtered_and_survives_upstream_retry() {
+    let harness = start_harness_with_mode(64 * 1024, true, true).await;
+    let body = "application-managed-buffer";
+
+    assert_eq!(
+        post(harness.proxy_port, body).await,
+        "200",
+        "priming request should succeed"
+    );
+    let attempts_after_priming = harness.max_attempts.load(Ordering::SeqCst);
+
+    assert_eq!(
+        post(harness.proxy_port, body).await,
+        "200",
+        "retried request should still succeed"
+    );
+
+    let attempts = harness.max_attempts.load(Ordering::SeqCst);
+    assert!(
+        attempts > attempts_after_priming,
+        "test setup failed to force a retry: max attempts per request stayed at {attempts}"
+    );
+    assert_all_requests_carried(&harness.recorder, body);
+    assert_eq!(
+        harness.body_filter_calls.load(Ordering::SeqCst),
+        harness.recorder.bodies().len(),
+        "request_body_filter must run once for each forwarding attempt"
+    );
 }
 
 /// These tests break upstream connections on purpose; bound the client so a regression into
