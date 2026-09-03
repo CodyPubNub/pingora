@@ -66,7 +66,9 @@ use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 #[cfg(feature = "early_body_buffer")]
-use pingora_core::protocols::http::v1::common::header_value_content_length;
+use pingora_core::protocols::http::v1::common::{
+    header_value_content_length, is_expect_continue_req,
+};
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
@@ -869,22 +871,28 @@ impl Session {
         self.shutdown_flag.load(Ordering::Acquire)
     }
 
-    /// Returns a reference to the buffered request body, if any.
+    /// Returns a reference to the fully buffered request body, if non-empty.
     ///
-    /// The body is buffered by `buffer_request_body_early()` when the trait method
-    /// `early_request_body_buffer_limit()` returns `Some(max_size)`.
+    /// The body may be buffered automatically when
+    /// [`ProxyHttp::early_request_body_buffer_limit()`] returns `Some(max_size)`, or supplied by
+    /// application code through [`Self::set_buffered_body()`].
     #[cfg(feature = "early_body_buffer")]
     pub fn get_buffered_body(&self) -> Option<&Bytes> {
         self.buffered_request_body.as_ref()
     }
 
-    /// Sets the buffered request body.
+    /// Sets a fully consumed request body for upstream forwarding.
     ///
-    /// This is called by `buffer_request_body_early()` after reading the full body.
-    /// Also useful for app code that wants to replace the body (e.g., decompression).
+    /// The body is retained and replayed across upstream retries. `None` marks the request body as
+    /// fully consumed and empty.
+    ///
+    /// Application code calling this directly must first fully consume the downstream body and
+    /// handle `Expect: 100-continue` before reading. It must also update request framing
+    /// (`Content-Length`, `Transfer-Encoding`, and H2 end-of-stream behavior) to describe the
+    /// supplied body.
     #[cfg(feature = "early_body_buffer")]
     pub fn set_buffered_body(&mut self, body: Option<Bytes>) {
-        self.body_buffered = body.is_some() || self.body_buffered;
+        self.body_buffered = true;
         self.buffered_request_body = body;
     }
 
@@ -899,8 +907,7 @@ impl Session {
 
     /// Marks the body as buffered without setting a body.
     ///
-    /// Used when the request has no body (no Content-Length or Transfer-Encoding),
-    /// to prevent `buffer_request_body_early()` from attempting to read.
+    /// Used when buffering confirms that the request body is empty.
     #[cfg(feature = "early_body_buffer")]
     pub fn mark_body_buffered(&mut self) {
         self.body_buffered = true;
@@ -1403,6 +1410,38 @@ where
             return Ok(());
         }
 
+        let total_timeout = self.inner.early_request_body_buffer_timeout(session, ctx);
+        if let Some(total_timeout) = total_timeout {
+            match pingora_timeout::timeout(
+                total_timeout,
+                self.buffer_request_body_early_inner(session, ctx, max_size),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Error::e_explain(
+                    ReadTimedout,
+                    format!("buffering request body, timeout: {total_timeout:?}"),
+                )
+                .map_err(|e| e.into_down()),
+            }
+        } else {
+            self.buffer_request_body_early_inner(session, ctx, max_size)
+                .await
+        }
+    }
+
+    #[cfg(feature = "early_body_buffer")]
+    async fn buffer_request_body_early_inner(
+        &self,
+        session: &mut Session,
+        ctx: &mut <SV as ProxyHttp>::CTX,
+        max_size: usize,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        <SV as ProxyHttp>::CTX: Send + Sync,
+    {
         let content_length = header_value_content_length(
             session
                 .downstream_session
@@ -1430,6 +1469,14 @@ where
         if content_length == Some(0) {
             session.mark_body_buffered();
             return Ok(());
+        }
+
+        if is_expect_continue_req(session.downstream_session.req_header()) {
+            session
+                .downstream_session
+                .write_continue_response()
+                .await
+                .map_err(|e| e.into_down())?;
         }
 
         let mut body_parts: Vec<Bytes> = Vec::new();
@@ -2536,13 +2583,10 @@ mod tests {
         }
 
         #[test]
-        fn test_set_none_preserves_buffered_flag() {
+        fn test_set_none_marks_empty_body_buffered() {
             let mut session = create_test_session();
-            let body = Bytes::from("test body");
 
-            session.set_buffered_body(Some(body));
-            assert!(session.is_body_buffered());
-
+            assert!(!session.is_body_buffered());
             session.set_buffered_body(None);
             assert!(session.is_body_buffered());
             assert!(session.get_buffered_body().is_none());

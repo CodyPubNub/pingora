@@ -159,7 +159,8 @@ connection_filter = [
 ]
 
 ## Enable buffering the full request body before `upstream_peer`, via the
-## `early_request_body_buffer_limit` and `early_request_body_filter` trait hooks.
+## `early_request_body_buffer_limit`, `early_request_body_buffer_timeout`, and
+## `early_request_body_filter` trait hooks.
 early_body_buffer = ["pingora-proxy?/early_body_buffer"]
 
 

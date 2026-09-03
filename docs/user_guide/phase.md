@@ -62,9 +62,11 @@ This is the first phase of every request.
 This function is similar to `request_filter()` but executes before any other logic, including downstream module logic. The main purpose of this function is to provide finer-grained control of the behavior of the modules.
 
 ### `early_request_body_filter()`
-This phase runs during early body buffering, **before** `request_filter()` and `upstream_peer()`. It is only called when `early_request_body_buffer_limit()` returns `Some(max_size)`, which opts in to reading and buffering the full request body before upstream peer selection. Requires the `early_body_buffer` cargo feature.
+This phase runs during early body buffering, **before** `request_filter()` and `upstream_peer()`. It is only called when `early_request_body_buffer_limit()` returns `Some(max_size)`, which opts in to reading and buffering the full request body before upstream peer selection. `early_request_body_buffer_timeout()` can optionally bound the complete buffering phase, including body-filter callbacks. Requires the `early_body_buffer` cargo feature.
 
 Use this for processing that must happen before header filters run, such as streaming decompression. The buffered body is then available via `session.get_buffered_body()` in `request_filter()` for routing decisions, auth signature verification, or body mutation.
+
+Pingora answers an HTTP/1.1 `Expect: 100-continue` request locally before reading an automatically buffered body. The original header remains visible to application filters but is removed from the upstream request after `upstream_request_filter()`.
 
 ### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context. When early body buffering is enabled, the full body is already available via `session.get_buffered_body()`.

@@ -126,6 +126,11 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&header::EXPECT);
+        }
+
         // Remove H1 `Host` header, save it in order to add to :authority
         // We do this because certain H2 servers expect request not to have a host header.
         // The `Host` is removed after the upstream filters above for 2 reasons
@@ -449,11 +454,24 @@ where
             )
         };
 
-        // retry, send buffer if it exists
+        #[cfg(not(feature = "early_body_buffer"))]
         if let Some(buffer) = buffer {
             self.send_body_to2(
                 session,
                 Some(buffer),
+                downstream_state.is_done(),
+                client_body,
+                ctx,
+                write_timeout,
+            )
+            .await?;
+        }
+
+        #[cfg(feature = "early_body_buffer")]
+        if buffer.is_some() || session.is_body_buffered() {
+            self.send_body_to2(
+                session,
+                buffer,
                 downstream_state.is_done(),
                 client_body,
                 ctx,

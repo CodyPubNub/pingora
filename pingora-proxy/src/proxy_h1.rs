@@ -82,6 +82,11 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&header::EXPECT);
+        }
+
         if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !session.is_body_empty()) {
             return (false, true, Some(e));
         }

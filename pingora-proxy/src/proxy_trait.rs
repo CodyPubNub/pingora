@@ -243,8 +243,8 @@ pub trait ProxyHttp {
     /// Determine whether to buffer the entire request body before connecting to upstream.
     ///
     /// This is called after [`Self::early_request_filter()`] but before [`Self::request_filter()`]
-    /// and [`Self::upstream_peer()`]. The body is buffered in `Session::buffered_request_body`
-    /// and can be accessed via [`Session::get_buffered_body()`].
+    /// and [`Self::upstream_peer()`]. The body can be accessed via
+    /// [`Session::get_buffered_body()`].
     ///
     /// # Returns
     /// - `None`: Don't buffer, stream body to upstream (default)
@@ -261,6 +261,8 @@ pub trait ProxyHttp {
     /// - Body size is checked during accumulation (streaming protection)
     /// - If exceeded, returns HTTP 413 (Payload Too Large)
     ///
+    /// Use [`Self::early_request_body_buffer_timeout()`] to apply a total deadline to this phase.
+    ///
     /// Requires the `early_body_buffer` feature.
     #[cfg(feature = "early_body_buffer")]
     fn early_request_body_buffer_limit(
@@ -269,6 +271,25 @@ pub trait ProxyHttp {
         _ctx: &Self::CTX,
     ) -> Option<usize> {
         None // Default: stream body to upstream
+    }
+
+    /// Set a deadline for buffering the entire request body.
+    ///
+    /// The deadline includes local `100 Continue` handling, downstream reads, and
+    /// [`Self::early_request_body_filter()`] calls. When it expires, buffering fails with a
+    /// downstream read timeout. Returning `None` leaves total buffering time unbounded, although
+    /// protocol-specific per-read timeouts may still apply.
+    ///
+    /// This is only consulted when [`Self::early_request_body_buffer_limit()`] returns `Some`.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
+    fn early_request_body_buffer_timeout(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<Duration> {
+        None
     }
 
     /// Handle each chunk of request body during early buffering.

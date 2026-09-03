@@ -22,6 +22,7 @@ path = "src/lib.rs"
 pingora-error = { version = "0.8.0", path = "../pingora-error" }
 pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
 pingora-cache = { version = "0.8.0", path = "../pingora-cache", default-features = false }
+pingora-timeout = { version = "0.8.0", path = "../pingora-timeout", optional = true }
 tokio = { workspace = true, features = ["macros", "net"] }
 pingora-http = { version = "0.8.0", path = "../pingora-http" }
 http = { workspace = true }
@@ -77,7 +78,7 @@ patched_http1 = ["pingora-core/patched_http1"]
 upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
 trace = ["pingora-cache/trace"]
-early_body_buffer = []
+early_body_buffer = ["dep:pingora-timeout"]
 
 [[example]]
 name = "connection_filter"

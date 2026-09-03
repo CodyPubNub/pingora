@@ -33,6 +33,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use log::info;
+use std::time::Duration;
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -70,6 +71,15 @@ impl ProxyHttp for MyProxy {
         } else {
             None
         }
+    }
+
+    /// Bound the complete buffering phase, not only each downstream read.
+    fn early_request_body_buffer_timeout(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<Duration> {
+        Some(Duration::from_secs(10))
     }
 
     /// Stream: process each body chunk as it arrives during early buffering.
