@@ -215,6 +215,7 @@ where
                 rx,
                 ctx,
                 write_timeout,
+                body_empty,
                 &mut downstream_custom_message_writer,
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
@@ -399,6 +400,7 @@ where
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
         write_timeout: Option<Duration>,
+        upstream_body_finished: bool,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
@@ -409,6 +411,9 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        #[cfg(not(feature = "early_body_buffer"))]
+        let _ = upstream_body_finished;
+
         // setup custom message forwarding, if downstream supports it
         let (
             mut downstream_custom_read,
@@ -467,8 +472,9 @@ where
             .await?;
         }
 
+        // The caller already ended the stream for an empty downstream body on HEADERS or empty DATA.
         #[cfg(feature = "early_body_buffer")]
-        if buffer.is_some() || session.is_body_buffered() {
+        if buffer.is_some() || (session.is_body_buffered() && !upstream_body_finished) {
             self.send_body_to2(
                 session,
                 buffer,

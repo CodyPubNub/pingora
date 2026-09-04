@@ -576,6 +576,26 @@ async fn read_response_head(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
+async fn post_empty(port: u16) -> String {
+    tokio::time::timeout(CLIENT_TIMEOUT, async {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(b"POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        read_response_head(&mut stream)
+            .await
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("000")
+            .to_string()
+    })
+    .await
+    .expect("proxy did not answer the empty request")
+}
+
 async fn post_with_expect_continue(port: u16, body: &str) -> (String, String) {
     tokio::time::timeout(CLIENT_TIMEOUT, async {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -816,5 +836,24 @@ async fn filtered_empty_body_ends_h2_upstream_stream() {
         harness.recorder.bodies(),
         vec![String::new()],
         "H2 origin should observe a completed empty body"
+    );
+}
+
+#[tokio::test]
+async fn originally_empty_body_does_not_end_h2_upstream_stream_twice() {
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            use_h2_upstream: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post_empty(harness.proxy_port).await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![String::new()],
+        "H2 origin should observe the body completed by the HEADERS frame"
     );
 }
