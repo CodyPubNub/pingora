@@ -1628,6 +1628,9 @@ where
         // Transfer-Encoding, HTTP/2) attempt to read. read_request_body returns
         // None immediately if there's nothing.
         if content_length == Some(0) {
+            // Initialize the downstream reader from the original framing before request_filter
+            // can replace the body and mutate Content-Length.
+            session.downstream_session.is_body_done();
             session.mark_body_buffered();
             return Ok(());
         }
@@ -1640,8 +1643,10 @@ where
                 .map_err(|e| e.into_down())?;
         }
 
-        let mut body_parts: Vec<Bytes> = Vec::new();
-        let mut total_size: usize = 0;
+        let mut first_part: Option<Bytes> = None;
+        let mut combined: Option<bytes::BytesMut> = None;
+        let mut input_size: usize = 0;
+        let mut retained_size: usize = 0;
 
         // read body chunks until end of stream
         loop {
@@ -1654,6 +1659,19 @@ where
             // end of stream: None means no more data, or downstream reports done
             let end_of_body = body_chunk.is_none() || session.downstream_session.is_body_done();
 
+            if let Some(chunk) = body_chunk.as_ref() {
+                input_size = input_size.saturating_add(chunk.len());
+                if input_size > max_size {
+                    return Error::e_explain(
+                        HTTPStatus(413),
+                        format!(
+                            "Request body exceeded limit: {} > {} bytes",
+                            input_size, max_size
+                        ),
+                    );
+                }
+            }
+
             // run early body filter (not module filters, they haven't run header filter yet)
             let mut filter_data = body_chunk;
             self.inner
@@ -1662,20 +1680,30 @@ where
 
             // accumulate the (possibly filtered) data
             if let Some(filtered) = filter_data {
-                total_size += filtered.len();
+                retained_size = retained_size.saturating_add(filtered.len());
 
                 // check size limit during accumulation
-                if total_size > max_size {
+                if retained_size > max_size {
                     return Error::e_explain(
                         HTTPStatus(413),
                         format!(
                             "Request body exceeded limit: {} > {} bytes",
-                            total_size, max_size
+                            retained_size, max_size
                         ),
                     );
                 }
 
-                body_parts.push(filtered);
+                if let Some(combined) = combined.as_mut() {
+                    combined.extend_from_slice(&filtered);
+                } else if let Some(first) = first_part.take() {
+                    let capacity = content_length.unwrap_or(retained_size).max(retained_size);
+                    let mut body = bytes::BytesMut::with_capacity(capacity);
+                    body.extend_from_slice(&first);
+                    body.extend_from_slice(&filtered);
+                    combined = Some(body);
+                } else {
+                    first_part = Some(filtered);
+                }
             }
 
             if end_of_body {
@@ -1683,17 +1711,13 @@ where
             }
         }
 
-        if total_size == 0 {
+        if retained_size == 0 {
             session.mark_body_buffered();
-        } else if body_parts.len() == 1 {
-            // common case: a single chunk can be moved out without a second copy
-            session.set_buffered_body(body_parts.pop());
-        } else {
-            let mut combined = bytes::BytesMut::with_capacity(total_size);
-            for part in body_parts {
-                combined.extend_from_slice(&part);
-            }
+        } else if let Some(combined) = combined {
             session.set_buffered_body(Some(combined.freeze()));
+        } else {
+            // common case: a single chunk can be moved without a second copy
+            session.set_buffered_body(first_part);
         }
 
         Ok(())
@@ -2310,6 +2334,35 @@ mod tests {
         }
     }
 
+    struct NonIdempotentRetryProxy;
+
+    #[async_trait]
+    impl ProxyHttp for NonIdempotentRetryProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!()
+        }
+
+        fn error_while_proxy(
+            &self,
+            _peer: &HttpPeer,
+            _session: &mut Session,
+            mut error: Box<Error>,
+            _ctx: &mut Self::CTX,
+            client_reused: bool,
+        ) -> Box<Error> {
+            error.retry.decide_reuse(client_reused);
+            error
+        }
+    }
+
     fn default_policy_would_retry_for_session(
         session: &mut Session,
         retry: RetryType,
@@ -2385,6 +2438,28 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn application_override_can_enable_non_idempotent_retry() {
+        let mut session = new_request_session(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let peer = HttpPeer::new("127.0.0.1:80", false, "".to_string());
+
+        for client_reused in [false, true] {
+            let mut error = Error::new_up(ReadError);
+            error.retry = RetryType::ReusedOnly;
+
+            assert_eq!(
+                NonIdempotentRetryProxy
+                    .error_while_proxy(&peer, &mut session, error, &mut (), client_reused,)
+                    .retry(),
+                client_reused
+            );
+        }
     }
 
     #[tokio::test]

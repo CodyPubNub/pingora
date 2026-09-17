@@ -265,8 +265,18 @@ where
     /// # Size Limit Enforcement
     /// When returning `Some(max_size)`:
     /// - Content-Length header is checked first (fail fast before reading)
-    /// - Body size is checked during accumulation (streaming protection)
+    /// - Input bytes are checked before filtering
+    /// - Retained bytes are checked after filtering
     /// - If exceeded, returns HTTP 413 (Payload Too Large)
+    ///
+    /// # Retries
+    /// The complete retained body is separate from Pingora's ordinary 64 KiB retry buffer and can
+    /// be replayed on every retry allowed by [`Self::error_while_proxy()`].
+    /// `retry_buffer_truncated()` does not reflect this buffer's size. Choose a limit that accounts
+    /// for retaining and potentially replaying the full body on each attempt.
+    ///
+    /// The default retry policy still restricts retries to idempotent methods. Applications must
+    /// override [`Self::error_while_proxy()`] to opt non-idempotent requests into replay.
     ///
     /// Use [`Self::early_request_body_buffer_timeout()`] to apply a total deadline to this phase.
     ///
@@ -690,8 +700,8 @@ where
     /// to the upstream.
     ///
     /// By default, this hook forces retry to false, regardless of the incoming retry state, when
-    /// the request method is non-idempotent and its body is not fully buffered, or when the body
-    /// retry buffer was truncated. For eligible requests,
+    /// the request method is non-idempotent, or when the body retry buffer was truncated. For
+    /// eligible requests,
     /// [`pingora_error::RetryType::ReusedOnly`] errors are retried only on a reused connection.
     ///
     /// Implementations that override this hook replace the default policy and are responsible for
@@ -705,10 +715,6 @@ where
         client_reused: bool,
     ) -> Box<Error> {
         let mut e = e.more_context(format!("Peer: {}", peer));
-        #[cfg(feature = "early_body_buffer")]
-        let body_replayable =
-            session.req_header().method.is_idempotent() || session.is_body_buffered();
-        #[cfg(not(feature = "early_body_buffer"))]
         let body_replayable = session.req_header().method.is_idempotent();
         if !body_replayable || session.as_ref().retry_buffer_truncated() {
             e.set_retry(false);

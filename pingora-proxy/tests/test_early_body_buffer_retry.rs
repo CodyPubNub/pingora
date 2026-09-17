@@ -40,8 +40,8 @@ use tokio::net::{TcpListener, TcpStream};
 /// Per-harness rather than global so these tests stay independent under parallel runs.
 #[derive(Default)]
 struct Recorder {
-    /// (head, decoded body) per request, in arrival order.
-    requests: Mutex<Vec<(String, String)>>,
+    /// (head, decoded body, body framing completed) per request, in arrival order.
+    requests: Mutex<Vec<(String, String, bool)>>,
 }
 
 impl Recorder {
@@ -50,7 +50,7 @@ impl Recorder {
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, b)| b.clone())
+            .map(|(_, b, _)| b.clone())
             .collect()
     }
 
@@ -59,7 +59,16 @@ impl Recorder {
             .lock()
             .unwrap()
             .iter()
-            .map(|(h, _)| h.clone())
+            .map(|(h, _, _)| h.clone())
+            .collect()
+    }
+
+    fn body_completions(&self) -> Vec<bool> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, complete)| *complete)
             .collect()
     }
 }
@@ -96,7 +105,7 @@ async fn read_one_request(stream: &mut TcpStream, recorder: &Recorder) -> Option
 
     let mut body_raw = buf[head_end..].to_vec();
 
-    let body = if let Some(len) = content_length {
+    let (body, body_complete) = if let Some(len) = content_length {
         while body_raw.len() < len {
             match tokio::time::timeout(BODY_READ_TIMEOUT, stream.read(&mut chunk)).await {
                 Ok(Ok(0)) | Err(_) => break,
@@ -104,7 +113,10 @@ async fn read_one_request(stream: &mut TcpStream, recorder: &Recorder) -> Option
                 Ok(Err(_)) => return None,
             }
         }
-        String::from_utf8_lossy(&body_raw[..len.min(body_raw.len())]).to_string()
+        (
+            String::from_utf8_lossy(&body_raw[..len.min(body_raw.len())]).to_string(),
+            body_raw.len() >= len,
+        )
     } else if chunked {
         while !body_raw.windows(5).any(|w| w == b"0\r\n\r\n") {
             match tokio::time::timeout(BODY_READ_TIMEOUT, stream.read(&mut chunk)).await {
@@ -113,12 +125,17 @@ async fn read_one_request(stream: &mut TcpStream, recorder: &Recorder) -> Option
                 Ok(Err(_)) => return None,
             }
         }
-        dechunk(&body_raw)
+        let complete = body_raw.windows(5).any(|w| w == b"0\r\n\r\n");
+        (dechunk(&body_raw), complete)
     } else {
-        String::new()
+        (String::new(), true)
     };
 
-    recorder.requests.lock().unwrap().push((head, body));
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .push((head, body, body_complete));
     Some(())
 }
 
@@ -218,11 +235,11 @@ async fn spawn_h2_origin(recorder: Arc<Recorder>) -> u16 {
                             return;
                         }
 
-                        recorder
-                            .requests
-                            .lock()
-                            .unwrap()
-                            .push((head, String::from_utf8_lossy(&body_bytes).into_owned()));
+                        recorder.requests.lock().unwrap().push((
+                            head,
+                            String::from_utf8_lossy(&body_bytes).into_owned(),
+                            true,
+                        ));
 
                         let response = http::Response::builder().status(200).body(()).unwrap();
                         let Ok(mut response_body) = respond.send_response(response, false) else {
@@ -244,10 +261,16 @@ struct EarlyBufferProxy {
     buffer_in_request_filter: bool,
     buffer_timeout: Option<Duration>,
     drop_body_in_early_filter: bool,
+    early_filter_suffix: Option<&'static str>,
     replacement_body: Option<&'static str>,
     body_filter_calls: Arc<AtomicUsize>,
     upstream_filter_expect_seen: Arc<AtomicBool>,
     use_h2_upstream: bool,
+    max_attempts: Arc<AtomicUsize>,
+}
+
+struct DefaultRetryEarlyBufferProxy {
+    origin_port: u16,
     max_attempts: Arc<AtomicUsize>,
 }
 
@@ -289,6 +312,13 @@ impl ProxyHttp for EarlyBufferProxy {
             let req = session.downstream_session.req_header_mut();
             req.remove_header(&http::header::CONTENT_LENGTH);
             req.remove_header(&http::header::TRANSFER_ENCODING);
+        } else if let Some(suffix) = self.early_filter_suffix {
+            if let Some(chunk) = body.take() {
+                let mut expanded = BytesMut::with_capacity(chunk.len() + suffix.len());
+                expanded.extend_from_slice(&chunk);
+                expanded.extend_from_slice(suffix.as_bytes());
+                *body = Some(expanded.freeze());
+            }
         }
         Ok(())
     }
@@ -360,6 +390,20 @@ impl ProxyHttp for EarlyBufferProxy {
         Ok(peer)
     }
 
+    /// The replay tests intentionally opt POST requests into retry. Pingora's default policy
+    /// remains restricted to idempotent methods.
+    fn error_while_proxy(
+        &self,
+        _peer: &HttpPeer,
+        _session: &mut Session,
+        mut error: Box<Error>,
+        _ctx: &mut Ctx,
+        client_reused: bool,
+    ) -> Box<Error> {
+        error.retry.decide_reuse(client_reused);
+        error
+    }
+
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -379,12 +423,57 @@ impl ProxyHttp for EarlyBufferProxy {
     }
 }
 
+#[async_trait]
+impl ProxyHttp for DefaultRetryEarlyBufferProxy {
+    type CTX = Ctx;
+
+    fn new_ctx(&self) -> Ctx {
+        Ctx::default()
+    }
+
+    fn early_request_body_buffer_limit(&self, _session: &Session, _ctx: &Ctx) -> Option<usize> {
+        Some(64 * 1024)
+    }
+
+    async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
+        ctx.attempt += 1;
+        self.max_attempts.fetch_max(ctx.attempt, Ordering::SeqCst);
+
+        let mut peer = Box::new(HttpPeer::new(
+            format!("127.0.0.1:{}", self.origin_port),
+            false,
+            String::new(),
+        ));
+        peer.options.idle_timeout = Some(Duration::from_secs(60));
+        Ok(peer)
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        _error: &Error,
+        _ctx: &mut Ctx,
+    ) -> FailToProxy {
+        session.respond_error(500).await.unwrap();
+        FailToProxy {
+            error_code: 500,
+            can_reuse_downstream: false,
+        }
+    }
+}
+
 struct Harness {
     proxy_port: u16,
     body_filter_calls: Arc<AtomicUsize>,
     max_attempts: Arc<AtomicUsize>,
     recorder: Arc<Recorder>,
     upstream_filter_expect_seen: Arc<AtomicBool>,
+}
+
+struct DefaultRetryHarness {
+    proxy_port: u16,
+    max_attempts: Arc<AtomicUsize>,
+    recorder: Arc<Recorder>,
 }
 
 async fn start_harness(limit: usize, fail_first: bool) -> Harness {
@@ -419,50 +508,28 @@ struct HarnessConfig {
     buffer_in_request_filter: bool,
     buffer_timeout: Option<Duration>,
     drop_body_in_early_filter: bool,
+    early_filter_suffix: Option<&'static str>,
     replacement_body: Option<&'static str>,
     fail_first: bool,
     use_h2_downstream: bool,
     use_h2_upstream: bool,
 }
 
-async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harness {
-    let recorder = Arc::new(Recorder::default());
-    let origin_port = if config.use_h2_upstream {
-        spawn_h2_origin(recorder.clone()).await
-    } else {
-        spawn_origin(recorder.clone(), config.fail_first).await
-    };
-    let body_filter_calls = Arc::new(AtomicUsize::new(0));
-    let max_attempts = Arc::new(AtomicUsize::new(0));
-    let upstream_filter_expect_seen = Arc::new(AtomicBool::new(false));
-
+async fn spawn_proxy_service<SV>(app: SV, use_h2c: bool) -> u16
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    pingora_proxy::HttpProxy<SV>: pingora_core::apps::HttpServerApp,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let app_attempts = max_attempts.clone();
-    let app_body_filter_calls = body_filter_calls.clone();
-    let app_expect_seen = upstream_filter_expect_seen.clone();
     std::thread::spawn(move || {
         let mut server = pingora_core::server::Server::new(None).unwrap();
         server.bootstrap();
         let conf = Arc::new(ServerConf::default());
-        let mut service = pingora_proxy::http_proxy_service(
-            &conf,
-            EarlyBufferProxy {
-                origin_port,
-                limit,
-                buffer_in_request_filter: config.buffer_in_request_filter,
-                buffer_timeout: config.buffer_timeout,
-                drop_body_in_early_filter: config.drop_body_in_early_filter,
-                replacement_body: config.replacement_body,
-                body_filter_calls: app_body_filter_calls,
-                upstream_filter_expect_seen: app_expect_seen,
-                use_h2_upstream: config.use_h2_upstream,
-                max_attempts: app_attempts,
-            },
-        );
-        if config.use_h2_downstream {
+        let mut service = pingora_proxy::http_proxy_service(&conf, app);
+        if use_h2c {
             let mut options = HttpServerOptions::default();
             options.h2c = true;
             service.app_logic_mut().unwrap().server_options = Some(options);
@@ -486,12 +553,69 @@ async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harne
         "proxy did not start listening on 127.0.0.1:{proxy_port} within 10s"
     );
 
+    proxy_port
+}
+
+async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harness {
+    let recorder = Arc::new(Recorder::default());
+    let origin_port = if config.use_h2_upstream {
+        spawn_h2_origin(recorder.clone()).await
+    } else {
+        spawn_origin(recorder.clone(), config.fail_first).await
+    };
+    let body_filter_calls = Arc::new(AtomicUsize::new(0));
+    let max_attempts = Arc::new(AtomicUsize::new(0));
+    let upstream_filter_expect_seen = Arc::new(AtomicBool::new(false));
+
+    let app_attempts = max_attempts.clone();
+    let app_body_filter_calls = body_filter_calls.clone();
+    let app_expect_seen = upstream_filter_expect_seen.clone();
+    let proxy_port = spawn_proxy_service(
+        EarlyBufferProxy {
+            origin_port,
+            limit,
+            buffer_in_request_filter: config.buffer_in_request_filter,
+            buffer_timeout: config.buffer_timeout,
+            drop_body_in_early_filter: config.drop_body_in_early_filter,
+            early_filter_suffix: config.early_filter_suffix,
+            replacement_body: config.replacement_body,
+            body_filter_calls: app_body_filter_calls,
+            upstream_filter_expect_seen: app_expect_seen,
+            use_h2_upstream: config.use_h2_upstream,
+            max_attempts: app_attempts,
+        },
+        config.use_h2_downstream,
+    )
+    .await;
+
     Harness {
         proxy_port,
         body_filter_calls,
         max_attempts,
         recorder,
         upstream_filter_expect_seen,
+    }
+}
+
+async fn start_default_retry_harness() -> DefaultRetryHarness {
+    let recorder = Arc::new(Recorder::default());
+    let origin_port = spawn_origin(recorder.clone(), true).await;
+    let max_attempts = Arc::new(AtomicUsize::new(0));
+
+    let app_attempts = max_attempts.clone();
+    let proxy_port = spawn_proxy_service(
+        DefaultRetryEarlyBufferProxy {
+            origin_port,
+            max_attempts: app_attempts,
+        },
+        false,
+    )
+    .await;
+
+    DefaultRetryHarness {
+        proxy_port,
+        max_attempts,
+        recorder,
     }
 }
 
@@ -592,6 +716,37 @@ async fn read_response_head(stream: &mut TcpStream) -> String {
         response.extend_from_slice(&chunk[..n]);
     }
     String::from_utf8_lossy(&response).into_owned()
+}
+
+async fn read_response(stream: &mut TcpStream) -> String {
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = stream.read(&mut chunk).await.unwrap();
+        if n == 0 {
+            return String::from_utf8_lossy(&response).into_owned();
+        }
+        response.extend_from_slice(&chunk[..n]);
+    };
+
+    let head = String::from_utf8_lossy(&response[..head_end]).into_owned();
+    let content_length = head
+        .to_ascii_lowercase()
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while response.len() < head_end + content_length {
+        let n = stream.read(&mut chunk).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..n]);
+    }
+    head
 }
 
 async fn post_empty(port: u16) -> String {
@@ -735,6 +890,33 @@ async fn early_buffered_body_survives_upstream_retry() {
     assert_all_requests_carried(&harness.recorder, body);
 }
 
+#[tokio::test]
+async fn default_retry_policy_does_not_replay_buffered_post() {
+    let harness = start_default_retry_harness().await;
+    let body = "non-idempotent-body";
+
+    assert_eq!(
+        post(harness.proxy_port, body).await,
+        "200",
+        "priming request should succeed"
+    );
+    assert_eq!(
+        post(harness.proxy_port, body).await,
+        "500",
+        "default policy must not retry the failed POST"
+    );
+    assert_eq!(
+        harness.max_attempts.load(Ordering::SeqCst),
+        1,
+        "the priming POST or failed POST unexpectedly started a second upstream attempt"
+    );
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![body.to_string(), body.to_string()],
+        "expected the priming POST plus one failed POST delivery; a third body means replay"
+    );
+}
+
 /// Same, for a chunked body — the framing the early buffer has to reconstruct itself.
 #[tokio::test]
 async fn early_buffered_chunked_body_survives_upstream_retry() {
@@ -780,6 +962,45 @@ async fn oversized_body_is_rejected_not_silently_emptied() {
         harness.recorder.bodies().is_empty(),
         "rejected request must never reach the origin, saw {:?}",
         harness.recorder.bodies()
+    );
+}
+
+#[tokio::test]
+async fn chunked_input_limit_is_enforced_before_filter_discards_bytes() {
+    let harness = start_harness_with_config(
+        8,
+        HarnessConfig {
+            drop_body_in_early_filter: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        post_chunked(harness.proxy_port, "seventeen-byte-msg").await,
+        "413"
+    );
+    assert!(
+        harness.recorder.bodies().is_empty(),
+        "filtered oversized input must never reach the origin"
+    );
+}
+
+#[tokio::test]
+async fn retained_body_limit_is_enforced_after_filter_expands_bytes() {
+    let harness = start_harness_with_config(
+        8,
+        HarnessConfig {
+            early_filter_suffix: Some("x"),
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post(harness.proxy_port, "12345678").await, "413");
+    assert!(
+        harness.recorder.bodies().is_empty(),
+        "expanded oversized body must never reach the origin"
     );
 }
 
@@ -880,6 +1101,30 @@ async fn filtered_empty_body_ends_h2_upstream_stream() {
 }
 
 #[tokio::test]
+async fn filtered_empty_body_ends_h1_upstream_stream() {
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            drop_body_in_early_filter: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post(harness.proxy_port, "removed-body").await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![String::new()],
+        "H1 origin should observe an empty body"
+    );
+    assert_eq!(
+        harness.recorder.body_completions(),
+        vec![true],
+        "H1 origin should receive the terminating chunk"
+    );
+}
+
+#[tokio::test]
 async fn originally_empty_body_does_not_end_h2_upstream_stream_twice() {
     let harness = start_harness_with_config(
         64 * 1024,
@@ -916,6 +1161,40 @@ async fn empty_h1_request_body_can_be_replaced_for_h1_upstream() {
         vec![REPLACEMENT.to_string()],
         "H1 origin should receive the application-supplied body"
     );
+}
+
+#[tokio::test]
+async fn replacing_content_length_zero_body_preserves_downstream_keepalive() {
+    const REPLACEMENT: &str = "replacement-body";
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            replacement_body: Some(REPLACEMENT),
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", harness.proxy_port))
+        .await
+        .unwrap();
+    for request_number in 1..=2 {
+        stream
+            .write_all(b"POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        let response = read_response(&mut stream).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "request #{request_number} did not complete on the same downstream connection: {response}"
+        );
+        assert!(
+            !response.to_ascii_lowercase().contains("connection: close"),
+            "request #{request_number} unexpectedly disabled downstream keepalive: {response}"
+        );
+    }
 }
 
 #[tokio::test]

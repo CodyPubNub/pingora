@@ -508,8 +508,15 @@ where
             )
         };
 
-        // retry, send buffer if it exists or body empty
-        if buffer.is_some() || session.as_mut().is_body_empty() {
+        // Keep is_body_empty() last: it initializes the H1 reader and must stay lazy when buffered.
+        #[cfg(feature = "early_body_buffer")]
+        let should_send_initial_body =
+            buffer.is_some() || session.is_body_buffered() || session.as_mut().is_body_empty();
+        #[cfg(not(feature = "early_body_buffer"))]
+        let should_send_initial_body = buffer.is_some() || session.as_mut().is_body_empty();
+
+        // Send the final task for buffered empty bodies so H1 chunked framing is terminated.
+        if should_send_initial_body {
             let send_permit = tx
                 .reserve()
                 .await

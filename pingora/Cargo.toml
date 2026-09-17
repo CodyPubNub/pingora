@@ -38,10 +38,7 @@ document-features = { version = "0.2.10", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 env_logger = "0.11"
-reqwest = { version = "0.12", features = [
-    "rustls-tls",
-    "http2",
-], default-features = false }
+reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
